@@ -20,7 +20,7 @@ from collections import Counter
 from dataclasses import dataclass, field, replace
 from datetime import date, timedelta
 
-from .income import GIG, ONE_TIME, PROJECTABLE, TRANSITIONAL_END, classify_income_description
+from .income import GIG, PROJECTABLE, TRANSITIONAL_END, classify_income_description
 from .loader import Event, FXTable, Profile
 
 FIXED_CADENCE_CATEGORIES = frozenset(
@@ -46,6 +46,12 @@ AMOUNT_CV_TOLERANCE = 0.12  # observed max in real data: 0.097
 GAP_MIN_DAYS = 25
 GAP_MAX_DAYS = 35
 DEFAULT_HISTORY_DAYS = 180  # observed real window: 175-179 days
+
+# Minimum total occurrences pooled across every GIG-classified description for
+# a user before a gig income stream is confirmed at all (DECISIONS.md #9):
+# pooled, not per-description, since this dataset bills the same freelancer
+# under a different description for nearly every engagement.
+GIG_POOL_MIN_OCCURRENCES = 3
 
 
 @dataclass(frozen=True, slots=True)
@@ -84,12 +90,20 @@ class ConfirmedFutureEvent:
 
 @dataclass(frozen=True, slots=True)
 class IncomeModel:
-    status: str  # "continuing" | "gig" | "none"
-    description: str | None = None
-    classification: str | None = None
-    amount: float | None = None
-    cadence_days: int | None = None
-    next_date: date | None = None
+    """One confirmed, independently-evidenced income stream.
+
+    A user can have more than one at once (DECISIONS.md #9: a base salary and
+    a later commission are both real, concurrent income in this dataset).
+    Only constructed for a stream that actually has confirmed future income;
+    a stream with no evidence simply does not appear in UserState.income_streams.
+    """
+
+    stream: str  # "continuing_salary" | "gig"
+    description: str
+    classification: str
+    amount: float
+    cadence_days: int
+    next_date: date
     source_event_ids: tuple[str, ...] = ()
 
 
@@ -109,7 +123,7 @@ class UserState:
     recurring_fixed: list[RecurringFixed]
     irregular_rates: list[IrregularRate]
     confirmed_future_events: list[ConfirmedFutureEvent]
-    income: IncomeModel
+    income_streams: list[IncomeModel]
     unresolved_events: list[UnresolvedEvent]
     history_window_start: date
     history_window_end: date
@@ -207,84 +221,105 @@ def _compute_irregular_rate(rows: list[Event], window_start: date, window_end: d
     )
 
 
-def _build_income_model(salary_rows: list[Event], as_of_date: date) -> IncomeModel:
+def _build_continuing_salary_stream(salary_rows: list[Event], as_of_date: date) -> IncomeModel | None:
+    """The base-salary / employment lifecycle stream, evaluated on its own
+    evidence only (DECISIONS.md #9). GIG and ONE_TIME rows never enter this
+    stream's history at all, so a later commission or bonus payment cannot
+    make an established base salary look like it stopped."""
     usable = sorted(
         (
             r
             for r in salary_rows
-            if r.amount is not None and r.settlement_date is not None and r.status in ("settled", "scheduled")
+            if r.amount is not None
+            and r.settlement_date is not None
+            and r.status in ("settled", "scheduled")
+            and classify_income_description(r.category, r.description) in PROJECTABLE | {TRANSITIONAL_END}
         ),
         key=lambda r: r.settlement_date,
     )
     if not usable:
-        return IncomeModel(status="none")
+        return None
 
-    # One-time bonuses/arrears never gate whether income continues (DECISIONS.md #4
-    # only calls out transitional-end markers); find the most recent row that
-    # actually carries continuation signal.
-    governing = None
-    for r in reversed(usable):
-        cls = classify_income_description(r.category, r.description)
-        if cls != ONE_TIME:
-            governing = (r, cls)
-            break
-    if governing is None:
-        return IncomeModel(status="none")
-    last_row, cls = governing
-
+    last_row = usable[-1]
+    cls = classify_income_description(last_row.category, last_row.description)
     if cls == TRANSITIONAL_END:
-        return IncomeModel(status="none", description=last_row.description, classification=cls)
+        # This stream's own most recent record is a job-ending marker with
+        # nothing after it: no confirmed future salary (DECISIONS.md #4).
+        return None
 
-    if cls in PROJECTABLE:
-        same_desc = [r for r in usable if r.description == last_row.description]
-        pattern = _detect_fixed_recurring(same_desc)
-        if pattern is not None:
-            amount = pattern.amount
-            day_of_month = pattern.day_of_month
-        else:
-            # Too few occurrences to period-match (e.g. a job just started);
-            # the newest record is still the highest-priority confirmed fact.
-            amount = last_row.amount
-            day_of_month = last_row.settlement_date.day
-        next_date = (
-            last_row.settlement_date
-            if last_row.status == "scheduled"
-            else _next_month_on_day(last_row.settlement_date, day_of_month)
-        )
-        return IncomeModel(
-            status="continuing",
-            description=last_row.description,
-            classification=cls,
-            amount=amount,
-            cadence_days=30,
-            next_date=next_date,
-            source_event_ids=tuple(r.event_id for r in same_desc),
-        )
+    same_desc = [r for r in usable if r.description == last_row.description]
+    pattern = _detect_fixed_recurring(same_desc)
+    if pattern is not None:
+        amount = pattern.amount
+        day_of_month = pattern.day_of_month
+    else:
+        # Too few occurrences to period-match (e.g. a job just started);
+        # the newest record is still the highest-priority confirmed fact.
+        amount = last_row.amount
+        day_of_month = last_row.settlement_date.day
+    next_date = (
+        last_row.settlement_date
+        if last_row.status == "scheduled"
+        else _next_month_on_day(last_row.settlement_date, day_of_month)
+    )
+    return IncomeModel(
+        stream="continuing_salary",
+        description=last_row.description,
+        classification=cls,
+        amount=amount,
+        cadence_days=30,
+        next_date=next_date,
+        source_event_ids=tuple(r.event_id for r in same_desc),
+    )
 
-    if cls == GIG:
-        same_desc = sorted(
-            (r for r in usable if r.description == last_row.description and r.status == "settled"),
-            key=lambda r: r.settlement_date,
-        )
-        if len(same_desc) < RECURRING_MIN_OCCURRENCES:
-            # Not enough evidence to confidently project variable income;
-            # conservative default is no assumed future occurrence.
-            return IncomeModel(status="none", description=last_row.description, classification=cls)
-        dates = [r.settlement_date for r in same_desc]
-        gaps = [(dates[i + 1] - dates[i]).days for i in range(len(dates) - 1)]
-        cadence_days = round(statistics.median(gaps))
-        conservative_amount = min(r.amount for r in same_desc)
-        return IncomeModel(
-            status="gig",
-            description=last_row.description,
-            classification=cls,
-            amount=conservative_amount,
-            cadence_days=cadence_days,
-            next_date=dates[-1] + timedelta(days=cadence_days),
-            source_event_ids=tuple(r.event_id for r in same_desc),
-        )
 
-    return IncomeModel(status="none")
+def _build_gig_stream(salary_rows: list[Event], as_of_date: date) -> IncomeModel | None:
+    """The variable/freelance stream, pooling every GIG-classified description
+    together (DECISIONS.md #9). This dataset regularly bills the same
+    freelancer under a different description per engagement, so requiring one
+    exact description to repeat 3+ times undercounts real, ongoing gig income."""
+    pool = sorted(
+        (
+            r
+            for r in salary_rows
+            if r.amount is not None
+            and r.settlement_date is not None
+            and r.status == "settled"
+            and classify_income_description(r.category, r.description) == GIG
+        ),
+        key=lambda r: r.settlement_date,
+    )
+    if len(pool) < GIG_POOL_MIN_OCCURRENCES:
+        # Not enough pooled evidence to confidently project variable income;
+        # conservative default is no assumed future occurrence.
+        return None
+    dates = [r.settlement_date for r in pool]
+    gaps = [(dates[i + 1] - dates[i]).days for i in range(len(dates) - 1)]
+    cadence_days = round(statistics.median(gaps))
+    conservative_amount = min(r.amount for r in pool)  # DECISIONS.md #5: minimum observed, not mean
+    return IncomeModel(
+        stream="gig",
+        description=pool[-1].description,
+        classification=GIG,
+        amount=conservative_amount,
+        cadence_days=cadence_days,
+        next_date=dates[-1] + timedelta(days=cadence_days),
+        source_event_ids=tuple(r.event_id for r in pool),
+    )
+
+
+def _build_income_streams(salary_rows: list[Event], as_of_date: date) -> list[IncomeModel]:
+    """Each stream stands on its own evidence; a user can have both a
+    continuing salary and a gig stream at once, and neither can clobber the
+    other (DECISIONS.md #9)."""
+    streams = []
+    continuing = _build_continuing_salary_stream(salary_rows, as_of_date)
+    if continuing is not None:
+        streams.append(continuing)
+    gig = _build_gig_stream(salary_rows, as_of_date)
+    if gig is not None:
+        streams.append(gig)
+    return streams
 
 
 def build_user_state(
@@ -344,7 +379,7 @@ def build_user_state(
             irregular_rates.append(rate)
 
     salary_rows = [e for e in events if e.category == "salary"]
-    income = _build_income_model(salary_rows, as_of_date)
+    income_streams = _build_income_streams(salary_rows, as_of_date)
 
     return UserState(
         user_id=profile.user_id,
@@ -353,7 +388,7 @@ def build_user_state(
         recurring_fixed=recurring_fixed,
         irregular_rates=irregular_rates,
         confirmed_future_events=confirmed_future,
-        income=income,
+        income_streams=income_streams,
         unresolved_events=unresolved,
         history_window_start=history_start,
         history_window_end=as_of_date,

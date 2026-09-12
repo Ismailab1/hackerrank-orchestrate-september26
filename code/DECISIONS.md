@@ -272,3 +272,76 @@ directions, not one validation gate with one behavior.
    couple of percent signals a pipeline bug, not edge cases, and should be
    visible in the usage report before submission rather than discovered
    afterward from a bad score.
+
+## 9. Income is multiple independent streams, not one governing row
+
+**Bug found.** The first Stage 1 implementation of `_build_income_model`
+picked a single "governing" salary-category row: whichever settled or
+scheduled record was chronologically most recent for the user. That is
+wrong whenever a user genuinely has two concurrent income streams, which
+this dataset does regularly: a base salary (`Base salary` or
+`Payroll credit`) followed a week or so later, same cycle, by a commission
+payment (`Monthly sales commission`, `Account commission payment`,
+`Performance commission`).
+
+**What the data actually shows.** Across all 275 users, 50 have a base
+salary with 5+ clean monthly occurrences whose absolute most recent
+salary-category row is something else. Of those 50: 32 have a scheduled
+`Next confirmed salary` row last, which the old code already handled
+correctly (still `continuing`); 9 have a one-time `Promotion arrears
+payment` last, which the old code's one-time-skip logic also already
+handled correctly (falls through to the real `Payroll credit` row
+underneath); and 9 have a commission description last with fewer than 3
+occurrences of that exact description, which the old code genuinely got
+wrong, dropping an established base salary to `none` or a thin `gig`
+reading entirely. The 9 are `user_11`, `user_76`, `user_80`, `user_92`,
+`user_104`, `user_108`, `user_164`, `user_176`, `user_248`. (A user-supplied
+reproduction list named 8 of these plus `user_192`; `user_192`'s own most
+recent record is actually the scheduled `Next confirmed salary` row, which
+was never affected, so the real affected set is these 9, not that list of
+8.) Separately, of the 45 users with any gig-classified income at all, 29
+never reach 3 occurrences of one exact description because this dataset
+bills the same freelancer under a different description almost every
+engagement (`user_09`: 10 income events over 10 months, 8 different
+descriptions; `user_110` the same pattern) -- real, ongoing gig income that
+the per-description occurrence count was undercounting.
+
+**Decision.** Split income into independently evidenced streams instead of
+one governing row:
+
+1. A continuing-salary stream, built only from rows classified
+   `continuing`, `transitional_start`, or `transitional_end` in
+   `income.py` -- `gig` and `one_time` rows never enter its history, so a
+   later commission or bonus can no longer make an established base salary
+   look like it stopped. This stream zeroes out (no confirmed future
+   salary) only when its own most recent record is a `transitional_end`
+   marker, per entry 4, evaluated on this stream's own history, not
+   whatever salary-category row happens to be newest overall.
+2. A gig stream, pooling every `gig`-classified description for the user
+   together rather than requiring one exact description to repeat 3+
+   times, still requiring 3+ pooled occurrences as the evidence floor and
+   still using the minimum observed amount as the conservative estimate
+   (entry 5), with cadence taken from the median gap across the pooled,
+   sorted dates.
+3. Both streams are computed independently and both can contribute
+   confirmed income at once. A user can have a `continuing_salary` stream,
+   a `gig` stream, both, or neither; nothing about checking one stream
+   causes the other to be dropped. This follows the same "do not invent
+   unsupported financial information" principle already governing entry 4,
+   read the other way: it also means never unsupportedly *discarding* a
+   stream that has perfectly good evidence of its own.
+
+**Before / after, combined across all 275 users** (`code/pipeline/state.py`,
+verified by rerunning `python code/main.py` and `python code/main.py
+--sample`, zero errors either run):
+
+| | before (single governing row) | after (independent streams) |
+| --- | --- | --- |
+| has a continuing/base-salary income | 227 | 238 (228 salary-only + 10 with both) |
+| has a gig income | 16 | 40 (30 gig-only + 10 with both) |
+| no confirmed future income | 32 | 7 |
+
+The "no confirmed future income" count after the fix is exactly 7, matching
+entry 4's own empirical count of users whose most recent salary record is a
+genuine `Final employer payroll` ending with nothing after it -- confirming
+`none` no longer contains anything except real job endings.

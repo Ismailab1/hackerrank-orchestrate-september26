@@ -62,20 +62,24 @@ def print_summary(states: dict[str, UserState], errors: list[tuple[str, str, Exc
 
     fixed_counts = Counter()
     irregular_counts = Counter()
-    income_status_counts = Counter()
+    income_combo_counts = Counter()
     unresolved_total = 0
     confirmed_future_total = 0
     for state in states.values():
         fixed_counts[len(state.recurring_fixed)] += 1
         irregular_counts[len(state.irregular_rates)] += 1
-        income_status_counts[state.income.status] += 1
+        streams = {m.stream for m in state.income_streams}
+        if not streams:
+            income_combo_counts["none"] += 1
+        else:
+            income_combo_counts["+".join(sorted(streams))] += 1
         unresolved_total += len(state.unresolved_events)
         confirmed_future_total += len(state.confirmed_future_events)
 
     print()
     print("Recurring fixed obligations detected per user (count -> num users):", dict(sorted(fixed_counts.items())))
     print("Irregular essential rates detected per user (count -> num users):", dict(sorted(irregular_counts.items())))
-    print("Income model status distribution:", dict(income_status_counts))
+    print("Income stream combination distribution:", dict(income_combo_counts))
     print(f"Total unresolved (blank-amount) events across all users: {unresolved_total}")
     print(f"Total confirmed future events (reserved pending debits + scheduled) across all users: {confirmed_future_total}")
 
@@ -96,10 +100,12 @@ def print_user_detail(state: UserState) -> None:
     for r in state.irregular_rates:
         print(f"    {r.category:20s} daily_rate={r.daily_rate:,.2f}  flex={r.flexibility}  window_days={r.window_days}  total={r.total_amount:,.2f}")
 
-    inc = state.income
-    print(f"  Income: status={inc.status}  class={inc.classification}  description={inc.description}")
-    if inc.status != "none":
-        print(f"    amount={inc.amount:,.2f}  cadence_days={inc.cadence_days}  next_date={inc.next_date}")
+    print(f"  Income streams ({len(state.income_streams)}):")
+    if not state.income_streams:
+        print("    none")
+    for inc in state.income_streams:
+        print(f"    {inc.stream:18s} class={inc.classification:12s} description={inc.description}")
+        print(f"      amount={inc.amount:,.2f}  cadence_days={inc.cadence_days}  next_date={inc.next_date}")
 
     print(f"  Confirmed future events ({len(state.confirmed_future_events)}):")
     for c in state.confirmed_future_events[:15]:
