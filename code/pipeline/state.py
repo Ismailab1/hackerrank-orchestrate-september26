@@ -36,6 +36,15 @@ FIXED_CADENCE_CATEGORIES = frozenset(
         "insurance",
         "education",
         "housing",
+        # Added after re-running the day-of-month-spread/CV analysis across
+        # every category, not just an assumed subset (caught via
+        # sample_requests.csv validation -- see ARCHITECTURE.md Stage 3):
+        # these four show the identical fixed-cadence signature (day-of-month
+        # spread ~0, CV well under the 12% tolerance) as rent/utilities.
+        "entertainment",
+        "shopping",
+        "healthcare",
+        "family_support",
     }
 )
 IRREGULAR_ESSENTIAL_CATEGORIES = frozenset({"groceries", "transport", "dining"})
@@ -129,7 +138,7 @@ class UserState:
     history_window_end: date
 
 
-def _add_months(d: date, months: int) -> date:
+def add_months(d: date, months: int) -> date:
     total = d.month - 1 + months
     year = d.year + total // 12
     month = total % 12 + 1
@@ -137,8 +146,8 @@ def _add_months(d: date, months: int) -> date:
     return date(year, month, day)
 
 
-def _next_month_on_day(last_date: date, day_of_month: int) -> date:
-    candidate = _add_months(last_date, 1)
+def next_month_on_day(last_date: date, day_of_month: int) -> date:
+    candidate = add_months(last_date, 1)
     day = min(day_of_month, calendar.monthrange(candidate.year, candidate.month)[1])
     return candidate.replace(day=day)
 
@@ -260,7 +269,7 @@ def _build_continuing_salary_stream(salary_rows: list[Event], as_of_date: date) 
     next_date = (
         last_row.settlement_date
         if last_row.status == "scheduled"
-        else _next_month_on_day(last_row.settlement_date, day_of_month)
+        else next_month_on_day(last_row.settlement_date, day_of_month)
     )
     return IncomeModel(
         stream="continuing_salary",

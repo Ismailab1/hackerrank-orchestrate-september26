@@ -116,14 +116,18 @@ class FXTable:
 class Dataset:
     profiles: dict[str, Profile]
     events_by_user: dict[str, list[Event]]
+    events_by_id: dict[str, Event]
     fx: FXTable
     requests: list[Request]
     sample_requests: list[dict[str, str]]
     payment_options_by_request: dict[str, list[PaymentOption]]
     messages_by_request: dict[str, list[dict[str, str]]]
     messages_by_event: dict[str, list[dict[str, str]]]
+    messages_by_user: dict[str, list[dict[str, str]]]
+    messages_by_id: dict[str, dict[str, str]]
     images_by_request: dict[str, list[dict[str, str]]]
     images_by_event: dict[str, list[dict[str, str]]]
+    images_by_user: dict[str, list[dict[str, str]]]
 
 
 def _read_csv(path: Path) -> list[dict[str, str]]:
@@ -213,40 +217,67 @@ def load_payment_options(path: Path) -> dict[str, list[PaymentOption]]:
     return by_request
 
 
-def load_messages(path: Path) -> tuple[dict[str, list[dict[str, str]]], dict[str, list[dict[str, str]]]]:
+def load_messages(
+    path: Path,
+) -> tuple[dict[str, list[dict[str, str]]], dict[str, list[dict[str, str]]], dict[str, list[dict[str, str]]]]:
+    """Returns (by_request, by_event, by_user).
+
+    35% of messages.csv (76/215) have both request_id and related_event_id
+    blank -- associated only with user_id (e.g. an employer payroll-change
+    notice with no supplied target row). by_user is the complete index: since
+    every user has exactly one request (DECISIONS.md #1), gathering evidence
+    for a request means every message with that user_id, not just the ones
+    that happen to carry request_id or related_event_id.
+    """
     by_request: dict[str, list[dict[str, str]]] = {}
     by_event: dict[str, list[dict[str, str]]] = {}
+    by_user: dict[str, list[dict[str, str]]] = {}
     for row in _read_csv(path):
+        by_user.setdefault(row["user_id"], []).append(row)
         if row["request_id"].strip():
             by_request.setdefault(row["request_id"], []).append(row)
         if row["related_event_id"].strip():
             by_event.setdefault(row["related_event_id"], []).append(row)
-    return by_request, by_event
+    return by_request, by_event, by_user
 
 
-def load_images(path: Path) -> tuple[dict[str, list[dict[str, str]]], dict[str, list[dict[str, str]]]]:
+def load_images(
+    path: Path,
+) -> tuple[dict[str, list[dict[str, str]]], dict[str, list[dict[str, str]]], dict[str, list[dict[str, str]]]]:
+    """Returns (by_request, by_event, by_user). Every image row currently has
+    a request_id, but by_user is built the same way as messages for
+    consistency and to stay correct if that ever changes."""
     by_request: dict[str, list[dict[str, str]]] = {}
     by_event: dict[str, list[dict[str, str]]] = {}
+    by_user: dict[str, list[dict[str, str]]] = {}
     for row in _read_csv(path):
+        by_user.setdefault(row["user_id"], []).append(row)
         if row["request_id"].strip():
             by_request.setdefault(row["request_id"], []).append(row)
         if row["related_event_id"].strip():
             by_event.setdefault(row["related_event_id"], []).append(row)
-    return by_request, by_event
+    return by_request, by_event, by_user
 
 
 def load_dataset(dataset_dir: Path) -> Dataset:
-    messages_by_request, messages_by_event = load_messages(dataset_dir / "messages.csv")
-    images_by_request, images_by_event = load_images(dataset_dir / "images.csv")
+    messages_by_request, messages_by_event, messages_by_user = load_messages(dataset_dir / "messages.csv")
+    images_by_request, images_by_event, images_by_user = load_images(dataset_dir / "images.csv")
+    events_by_user = load_events(dataset_dir / "financial_events.csv")
+    events_by_id = {e.event_id: e for events in events_by_user.values() for e in events}
+    messages_by_id = {m["message_id"]: m for rows in messages_by_user.values() for m in rows}
     return Dataset(
         profiles=load_profiles(dataset_dir / "financial_profiles.csv"),
-        events_by_user=load_events(dataset_dir / "financial_events.csv"),
+        events_by_user=events_by_user,
+        events_by_id=events_by_id,
         fx=load_fx(dataset_dir / "exchange_rates.csv"),
         requests=load_requests(dataset_dir / "requests.csv"),
         sample_requests=_read_csv(dataset_dir / "sample_requests.csv"),
         payment_options_by_request=load_payment_options(dataset_dir / "request_payment_options.csv"),
         messages_by_request=messages_by_request,
         messages_by_event=messages_by_event,
+        messages_by_user=messages_by_user,
+        messages_by_id=messages_by_id,
         images_by_request=images_by_request,
         images_by_event=images_by_event,
+        images_by_user=images_by_user,
     )
