@@ -824,3 +824,121 @@ later lump sum clears is also a materially different ask than "wait."
 Two rescued rows is not worth contradicting a field definition -- the
 fail-closed posture from entry 8, applied to the rules themselves rather
 than just to the numbers.
+
+## 15. A household can have two continuing salaries, and one of them was invisible
+
+**Finding, from `financial_events.csv` directly.** Ten users carry both a
+`"Primary household salary"` (day 15, five occurrences, constant amount) and
+a `"Second household income"` (day 20, four occurrences, a different and
+smaller amount). `_build_continuing_salary_stream` only ever produced *one*
+stream per user, built from whichever salary-category row was
+chronologically last -- so for these users one of two genuinely separate,
+independently evidenced household incomes was not degraded but entirely
+absent from every forecast. Structurally the same bug entry 9 fixed once for
+salary-versus-gig, never caught for two salary-type streams in one
+household.
+
+Of those ten, only **seven** have a `Second household income` series that
+actually passes `_detect_fixed_recurring` on its own: `user_13`, `user_58`,
+`user_154`, `user_230`, `user_238`, `user_258`, `user_262`. The other three
+(`user_42` at 12.65% amount CV, `user_50` at 13.75%, `user_270` at 13.11%)
+fail the existing 12% tolerance and correctly stay single-stream. **No
+threshold was loosened to make this fix work** -- the second stream only
+appears where the evidence clears exactly the same bar every other recurring
+pattern has to clear.
+
+**Fix.** `_build_continuing_salary_streams` (now plural) groups the
+continuing / transitional_start rows by description and lets *any* group
+that independently passes `_detect_fixed_recurring` become its own
+`continuing_salary` stream, instead of a last-one-wins comparison. Nothing
+downstream needed changing: `_project_income_occurrences` already filters on
+`stream == "continuing_salary"` and iterates.
+
+Two deliberate guards:
+
+- An always-scheduled single-occurrence row (`"Next confirmed salary"`) is
+  the definitive *next occurrence* of a stream the user already has, never
+  evidence of an extra income source. It folds into the pattern whose amount
+  it sits closest to, contributing that pattern's confirmed next date and
+  amount. It is never allowed to stand alone while any pattern-backed group
+  exists -- otherwise a confirmation row would be double-counted as a
+  phantom third income. For `user_13`, `user_258`, and `user_270` its amount
+  matches `Primary household salary` exactly, so it anchors there.
+- Additional streams are added only when the primary group is itself
+  pattern-backed. When the newest row is a low-evidence one-off, that row
+  keeps deciding a single stream exactly as before -- which is what keeps
+  the case below untouched.
+
+**Scored impact**, full 250-row diff by `request_id`: **2 rows changed**,
+both removing a spending change the user does not actually need, and no row
+moved to a worse status. Five of the six scored users among the seven
+already had `amount_safe_to_pay` capped at `requested_amount`, so the extra
+headroom cannot move their row at all.
+
+`request_58` is the clearest case:
+
+| | before | after |
+| --- | --- | --- |
+| `amount_safe_to_pay` | 14,690,627.83 | 16,226,000 (full request) |
+| `affordability_status` | `affordable_with_plan` | `affordable_now` |
+| `spending_changes_needed` | `stop:event_5358` | `none` |
+| `decision_explanation` | "Stop the community fitness plan, then pay IDR 16,226,000 today." | "Pay IDR 16,226,000 today." |
+
+The old output told this person to cancel their gym membership to afford a
+payment they could already make outright with income they actually have.
+`request_154` improved the same way, dropping a
+`reduce_to:event_14186:27.20` it no longer needs.
+
+### The evidence that cuts the other way, and why it is recorded here
+
+`request_13` is the only one of the seven with a ground-truth row, and it
+**moves away from ground truth, in the less conservative direction**:
+
+| | ground truth | before fix | after fix |
+| --- | --- | --- | --- |
+| `amount_safe_to_pay` | 433.40 | 503.91 | 941.60 (capped) |
+| `affordability_status` | `affordable_later` | `not_affordable` | `affordable_now` |
+| `recommended_payment_method` | `wait` | `not_recommended` | `full_payment` |
+
+Ground truth says this household can safely pay 433.40 today and must wait
+until 2024-05-15 for the full amount, because "paying earlier would take the
+balance below the EUR 1,300 minimum." With both streams credited we say they
+can pay in full today. Our pre-fix figure was already 16% above ground
+truth; post-fix we are 117% above it. The sample harness's five exact-match
+counts are unchanged (8, 19, 19, 20, 19 of 25), but mean relative amount
+error rose 0.263 -> 0.304, entirely from this one row.
+
+The parsimonious reading is that the reference model credits only one
+household stream: with ~2,225/month of combined household income against a
+1,300 minimum, no reasonable expense forecast makes a 941.60 request
+unpayable until May. So this is a real conflict, not noise, and it is n=1
+only because `request_13` is the sole scored-or-sampled row where the
+mechanism is observable.
+
+`sample_requests.csv` is explicitly not evaluation labels (AGENTS.md: "Use
+it to understand format and decision style, not as labels for evaluation
+requests"), and the raw-data case for two separate streams is strong on its
+own. But the one external check available says the grader's model disagrees,
+and it disagrees in the direction this project has consistently refused to
+err in -- recommending the more aggressive action. Recorded prominently
+rather than buried, because a reader deciding whether to keep this fix needs
+both halves: it is better financial reasoning about the user's actual
+evidence, and it probably scores worse against the hidden ground truth.
+
+### Found and deliberately not fixed: a one-off record overriding a pattern
+
+A single low-evidence salary-category record with a different description
+than an established pattern, landing chronologically last, silently
+overrides that pattern's day of month and amount. Real and reproducible for
+exactly one user in all 275: `user_03`, whose one-off `"August 2019 net
+salary"` row (an image-extracted payslip that almost certainly describes the
+same August payment `"Payroll credit"` already covers) drags the projected
+day of month from 15 to 31.
+
+Not fixed, deliberately. `user_03` has no row in `requests.csv` -- it is
+sample-only -- so **zero scored rows are affected**, and distinguishing "a
+redundant confirmation of an existing pattern" from "the first payment of a
+genuinely new job" needs evidence the dataset does not reliably carry. The
+guard described above means the restructure leaves this case byte-identical
+rather than accidentally half-changing it, which was verified, not assumed.
+Noted here so nobody reopens it expecting measurable benefit.

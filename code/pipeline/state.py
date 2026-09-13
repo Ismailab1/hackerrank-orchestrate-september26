@@ -230,11 +230,34 @@ def _compute_irregular_rate(rows: list[Event], window_start: date, window_end: d
     )
 
 
-def _build_continuing_salary_stream(salary_rows: list[Event], as_of_date: date) -> IncomeModel | None:
-    """The base-salary / employment lifecycle stream, evaluated on its own
-    evidence only (DECISIONS.md #9). GIG and ONE_TIME rows never enter this
-    stream's history at all, so a later commission or bonus payment cannot
-    make an established base salary look like it stopped."""
+def _build_continuing_salary_streams(salary_rows: list[Event], as_of_date: date) -> list[IncomeModel]:
+    """The base-salary / employment lifecycle streams, each evaluated on its
+    own evidence only (DECISIONS.md #9). GIG and ONE_TIME rows never enter
+    this history at all, so a later commission or bonus payment cannot make
+    an established base salary look like it stopped.
+
+    A household can have more than one genuinely separate continuing salary
+    (DECISIONS.md #15): 7 users in this dataset run a `Primary household
+    salary` on day 15 *and* a `Second household income` on day 20, different
+    amounts, both independently pattern-backed. Any description group that
+    passes `_detect_fixed_recurring` on its own becomes its own stream rather
+    than losing a last-one-wins comparison.
+
+    Two deliberate guards:
+
+    - An always-scheduled, single-occurrence row (`"Next confirmed salary"`)
+      is the definitive *next occurrence* of a stream the user already has,
+      never evidence of an additional income source. It is folded into the
+      pattern whose amount it sits closest to, contributing that pattern's
+      confirmed next date and amount. It only stands alone when the user has
+      no pattern-backed group at all, which is the same fallback path a
+      just-started job takes.
+    - Additional streams are only added when the primary group is itself
+      pattern-backed. When the newest row is a low-evidence one-off with no
+      pattern of its own, that row keeps deciding the single stream exactly
+      as before -- see DECISIONS.md #15's second half for why that case is
+      deliberately left alone rather than "fixed" here.
+    """
     usable = sorted(
         (
             r
@@ -247,39 +270,94 @@ def _build_continuing_salary_stream(salary_rows: list[Event], as_of_date: date) 
         key=lambda r: r.settlement_date,
     )
     if not usable:
-        return None
+        return []
 
     last_row = usable[-1]
-    cls = classify_income_description(last_row.category, last_row.description)
-    if cls == TRANSITIONAL_END:
-        # This stream's own most recent record is a job-ending marker with
-        # nothing after it: no confirmed future salary (DECISIONS.md #4).
-        return None
+    if classify_income_description(last_row.category, last_row.description) == TRANSITIONAL_END:
+        # The most recent record is a job-ending marker with nothing after it:
+        # no confirmed future salary (DECISIONS.md #4).
+        return []
 
-    same_desc = [r for r in usable if r.description == last_row.description]
-    pattern = _detect_fixed_recurring(same_desc)
-    if pattern is not None:
-        amount = pattern.amount
-        day_of_month = pattern.day_of_month
+    groups: dict[str, list[Event]] = {}
+    for r in usable:
+        if classify_income_description(r.category, r.description) == TRANSITIONAL_END:
+            continue  # an ended source is never projected forward
+        groups.setdefault(r.description, []).append(r)
+
+    patterns: dict[str, RecurringFixed] = {}
+    for desc, rows in groups.items():
+        pattern = _detect_fixed_recurring(rows)
+        if pattern is not None:
+            patterns[desc] = pattern
+
+    primary_rows = groups.get(last_row.description, [last_row])
+    primary_is_scheduled_confirmation = (
+        last_row.description not in patterns
+        and all(r.status == "scheduled" for r in primary_rows)
+        and bool(patterns)
+    )
+
+    if primary_is_scheduled_confirmation:
+        # Fold the confirmation into the pattern it most plausibly continues,
+        # keeping its own (newer, confirmed) amount and date.
+        anchor_desc = min(
+            patterns, key=lambda d: abs(last_row.amount - patterns[d].amount) / max(patterns[d].amount, 1e-9)
+        )
+        primary = IncomeModel(
+            stream="continuing_salary",
+            description=anchor_desc,
+            classification=classify_income_description(last_row.category, last_row.description),
+            amount=last_row.amount,
+            cadence_days=30,
+            next_date=last_row.settlement_date,
+            source_event_ids=tuple(r.event_id for r in groups[anchor_desc]) + (last_row.event_id,),
+        )
+        primary_pattern_backed = True
     else:
-        # Too few occurrences to period-match (e.g. a job just started);
-        # the newest record is still the highest-priority confirmed fact.
-        amount = last_row.amount
-        day_of_month = last_row.settlement_date.day
-    next_date = (
-        last_row.settlement_date
-        if last_row.status == "scheduled"
-        else next_month_on_day(last_row.settlement_date, day_of_month)
-    )
-    return IncomeModel(
-        stream="continuing_salary",
-        description=last_row.description,
-        classification=cls,
-        amount=amount,
-        cadence_days=30,
-        next_date=next_date,
-        source_event_ids=tuple(r.event_id for r in same_desc),
-    )
+        anchor_desc = last_row.description
+        pattern = patterns.get(anchor_desc)
+        if pattern is not None:
+            amount, day_of_month = pattern.amount, pattern.day_of_month
+        else:
+            # Too few occurrences to period-match (e.g. a job just started);
+            # the newest record is still the highest-priority confirmed fact.
+            amount, day_of_month = last_row.amount, last_row.settlement_date.day
+        primary = IncomeModel(
+            stream="continuing_salary",
+            description=last_row.description,
+            classification=classify_income_description(last_row.category, last_row.description),
+            amount=amount,
+            cadence_days=30,
+            next_date=(
+                last_row.settlement_date
+                if last_row.status == "scheduled"
+                else next_month_on_day(last_row.settlement_date, day_of_month)
+            ),
+            source_event_ids=tuple(r.event_id for r in primary_rows),
+        )
+        primary_pattern_backed = pattern is not None
+
+    streams = [primary]
+    if primary_pattern_backed:
+        for desc, pattern in sorted(patterns.items()):
+            if desc == anchor_desc:
+                continue
+            rows = groups[desc]
+            next_date = next_month_on_day(pattern.last_date, pattern.day_of_month)
+            while next_date < as_of_date:
+                next_date = next_month_on_day(next_date, pattern.day_of_month)
+            streams.append(
+                IncomeModel(
+                    stream="continuing_salary",
+                    description=desc,
+                    classification=classify_income_description(rows[-1].category, desc),
+                    amount=pattern.amount,
+                    cadence_days=30,
+                    next_date=next_date,
+                    source_event_ids=tuple(r.event_id for r in rows),
+                )
+            )
+    return streams
 
 
 def _build_gig_stream(salary_rows: list[Event], as_of_date: date) -> IncomeModel | None:
@@ -318,13 +396,10 @@ def _build_gig_stream(salary_rows: list[Event], as_of_date: date) -> IncomeModel
 
 
 def _build_income_streams(salary_rows: list[Event], as_of_date: date) -> list[IncomeModel]:
-    """Each stream stands on its own evidence; a user can have both a
-    continuing salary and a gig stream at once, and neither can clobber the
-    other (DECISIONS.md #9)."""
-    streams = []
-    continuing = _build_continuing_salary_stream(salary_rows, as_of_date)
-    if continuing is not None:
-        streams.append(continuing)
+    """Each stream stands on its own evidence; a user can have a continuing
+    salary and a gig stream at once, or two separate continuing household
+    salaries, and none of them can clobber another (DECISIONS.md #9, #15)."""
+    streams = list(_build_continuing_salary_streams(salary_rows, as_of_date))
     gig = _build_gig_stream(salary_rows, as_of_date)
     if gig is not None:
         streams.append(gig)
