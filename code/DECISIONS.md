@@ -633,3 +633,84 @@ direction established in entry 8 and reinforced in entries 9, 10, and 11: a
 stream, a fact, or a plan stands on its own evidence, and when the evidence
 lands this close to the line the system declines rather than gambles with
 someone's rent money.
+
+## 13. The fixed-obligation projector double-counted a bill the confirmed record already covered
+
+**Bug.** `_project_fixed_occurrences` in `forecast.py` projected each user's
+recurring fixed obligations forward by calendar cadence with no awareness of
+`state.confirmed_future_events` -- unlike `_project_income_occurrences`
+directly below it, which already takes an `already_confirmed` set and skips
+a projected occurrence that a real confirmed event already backs. The
+expense side never got that treatment. So when a confirmed record (a
+pending or scheduled event) and the recurring pattern's own next projected
+occurrence both landed in the same category *and* the same calendar month,
+that single bill was charged twice against the 90-day simulation.
+
+**Spec grounding.** `problem_statement.md`'s conflict-resolution order,
+rule 3 -- "a settled event over an estimate or forecast" -- is exactly this
+situation: a confirmed record and a pattern projection describing the same
+bill, where the confirmed record wins.
+
+**Fix, deliberately narrow.** A `DUPLICATE_BILL_DESCRIPTIONS` set of five
+confirmed-event description strings that textually signal the same
+underlying bill -- `"Scheduled bill payment retry"`, `"Scheduled utility
+debit"`, `"Possible duplicate card charge"`, `"Scheduled insurance
+payment"`, `"Scheduled school fee"` -- used to suppress a projected
+occurrence only when a confirmed debit carrying one of those five
+descriptions already covers that same category and calendar month.
+
+Explicitly **not** a blanket same-category-same-month rule. Both rules were
+scanned across all 250 requests before choosing: 30 raw
+same-category-same-month overlaps exist, and the other descriptions among
+them (`"Pending merchant debit"`, `"Pending online order charge"`,
+`"Pending pharmacy card charge"`) carry no textual evidence they are the
+same bill rather than a genuinely separate one-time charge. Suppressing
+those would risk masking a real second debit -- the unsafe direction. Only
+the five explicit ones are suppressed; the change is scoped to that one
+function, and `_project_income_occurrences` was left alone since it already
+handles this correctly.
+
+**Measured impact**, full 250-row diff of the regenerated `output.csv`
+against the previously submitted one, matched by `request_id`:
+
+| | before | after |
+| --- | --- | --- |
+| `not_recommended` / `not_affordable` | 93 | 91 |
+| `installments` | 34 | 37 |
+| `partial_payment` | 9 | 8 |
+| `affordable_with_plan` | 49 | 51 |
+| `full_payment` / `wait` | 65 / 49 | 65 / 49 |
+
+13 of 250 rows changed, broken down exactly: **2 flip status**
+(`request_55` and `request_229`, both `not_affordable`/`not_recommended` ->
+`affordable_with_plan`/`installments`), **1 flips method only**
+(`request_224`, `partial_payment` -> `installments`, status unchanged at
+`affordable_with_plan`), and **10 shift numbers only**
+(`amount_safe_to_pay`, `payment_plan`, or
+`earliest_date_for_full_payment`). Every change is in the safer, more
+accurate direction and never the reverse -- verified mechanically, not
+eyeballed: zero rows moved to a worse affordability status, and zero rows
+saw `amount_safe_to_pay` decrease.
+
+**Regression check.** `python code/main.py --validate` run side by side
+against the committed pre-fix `forecast.py` and the fixed one (the pre-fix
+file restored from `HEAD`, then hash-verified back afterward). All five
+exact-match counts identical both ways: `amount_safe_to_pay` within 2% on
+8/25, `earliest_date_for_full_payment` exact 19/25, `affordability_status`
+exact 18/25, `recommended_payment_method` exact 19/25, `payment_plan` exact
+18/25. The only difference is the mean relative amount error, 0.261 ->
+0.263 -- a 0.002 move with no row crossing a pass/fail boundary, reported
+here rather than rounded away.
+
+**This does not close the near-miss gap from entry 12, and that was checked
+rather than assumed.** Two of the 21 near-miss rows entry 12 flagged do
+resolve here (`request_55`, which was short by 10.84% of its minimum
+balance, and `request_229`, short by 1.39%) -- but as a side effect of
+removing a specific, genuine double count, not because this addresses the
+calibration gap itself. The remaining near-miss rows are untouched: the
+tightest cases entry 12 traced by hand (`request_53`, `request_148`) have
+no confirmed-event overlap at all, and `request_100`'s overlap is a
+`"Pending online order charge"` that this fix deliberately does not
+suppress. A future reader should not reopen entry 12's gap expecting this to
+be the explanation -- it accounts for 2 of 21, and the other 19 remain
+accumulated forecasting uncertainty rather than a single findable bug.

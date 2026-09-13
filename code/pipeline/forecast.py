@@ -29,6 +29,22 @@ from .state import UserState, next_month_on_day
 
 FORECAST_DAYS = 90
 
+# Confirmed-event descriptions that textually signal the same underlying bill
+# a recurring fixed pattern already projects, not just any confirmed debit in
+# the same category and month (DECISIONS.md #13): a generic "Pending
+# merchant debit" or "Pending online order charge" could just as easily be a
+# separate one-time charge, with no textual evidence it's the same bill --
+# only these five say so explicitly.
+DUPLICATE_BILL_DESCRIPTIONS = frozenset(
+    {
+        "Scheduled bill payment retry",
+        "Scheduled utility debit",
+        "Possible duplicate card charge",
+        "Scheduled insurance payment",
+        "Scheduled school fee",
+    }
+)
+
 
 @dataclass(frozen=True, slots=True)
 class CashEvent:
@@ -41,14 +57,27 @@ class CashEvent:
     event_id: str | None  # set only for an already-confirmed event, never a projection
 
 
+def _confirmed_duplicate_bill_months(state: UserState) -> set[tuple[str, int, int]]:
+    """(category, year, month) already covered by a confirmed debit whose
+    description textually signals it's the same bill a recurring pattern
+    would otherwise also project -- see DUPLICATE_BILL_DESCRIPTIONS."""
+    return {
+        (c.category, c.date.year, c.date.month)
+        for c in state.confirmed_future_events
+        if c.direction == "debit" and c.description in DUPLICATE_BILL_DESCRIPTIONS
+    }
+
+
 def _project_fixed_occurrences(state: UserState, end: date) -> list[CashEvent]:
+    confirmed_months = _confirmed_duplicate_bill_months(state)
     events: list[CashEvent] = []
     for r in state.recurring_fixed:
         occ = next_month_on_day(r.last_date, r.day_of_month)
         while occ < state.as_of_date:
             occ = next_month_on_day(occ, r.day_of_month)
         while occ <= end:
-            events.append(CashEvent(occ, r.amount, "debit", r.category, r.description, r.flexibility, None))
+            if (r.category, occ.year, occ.month) not in confirmed_months:
+                events.append(CashEvent(occ, r.amount, "debit", r.category, r.description, r.flexibility, None))
             occ = next_month_on_day(occ, r.day_of_month)
     return events
 
