@@ -157,6 +157,60 @@ def _installment_schedule(opt: PaymentOption) -> list[tuple[date, float]]:
     ]
 
 
+def _eligible_installment_options(
+    state: UserState, request: Request, payment_options: list[PaymentOption]
+) -> list[tuple[PaymentOption, tuple[tuple[date, float], ...]]]:
+    """Installment options passing every eligibility gate except safety: the
+    user accepts installments at all, the option fits inside their own
+    `max_installment_months`, and its last payment lands on or before
+    `desired_completion_date`. Shared by both installment candidate paths so
+    the gates can't drift apart between them."""
+    profile = state.profile
+    if "installments" not in profile.payment_methods_user_will_consider or profile.max_installment_months is None:
+        return []
+    eligible = []
+    for opt in payment_options:
+        if opt.payment_method != "installments":
+            continue
+        if opt.number_of_payments > profile.max_installment_months:
+            continue
+        schedule = tuple(_installment_schedule(opt))
+        if schedule[-1][0] > request.desired_completion_date:
+            continue
+        eligible.append((opt, schedule))
+    return eligible
+
+
+def find_installment_with_spending_changes(
+    state: UserState,
+    eligible_options: list[tuple[PaymentOption, tuple[tuple[date, float], ...]]],
+    events_by_id: dict[str, Event],
+    forecast_days: int = 90,
+) -> tuple[tuple[SpendingChange, ...], PaymentOption, tuple[tuple[date, float], ...]] | None:
+    """Smallest combination (up to 3, per the output contract) of stop/reduce_to
+    changes that makes some eligible installment schedule safe.
+
+    problem_statement.md defines `affordable_with_plan` as the full requested
+    amount being completed "using a partial payment schedule, installments, or
+    permitted spending changes" -- it never restricts spending changes to a
+    same-day full payment, which is all the original implementation combined
+    them with (DECISIONS.md #14). Checks the installment schedule's own safety
+    against the modified state, not a lump sum."""
+    if not eligible_options:
+        return None
+    pool = _eligible_spending_changes(state, events_by_id, forecast_days)
+    minimum = state.profile.minimum_balance_to_keep
+    for size in (1, 2, 3):
+        for combo in combinations(pool, size):
+            modified_state = _apply_changes_to_state(state, combo)
+            for opt, schedule in eligible_options:
+                timeline = simulate_balance(modified_state, forecast_days, extra_payments=schedule)
+                if min(b for _, b in timeline) >= minimum:
+                    changes = tuple(SpendingChange(c["kind"], c["event_id"], c["new_amount"]) for c in combo)
+                    return changes, opt, schedule
+    return None
+
+
 def generate_candidates(
     state: UserState,
     request: Request,
@@ -202,22 +256,14 @@ def generate_candidates(
             )
         )
 
-    if "installments" in methods and profile.max_installment_months is not None:
-        for opt in payment_options:
-            if opt.payment_method != "installments":
-                continue
-            if opt.number_of_payments > profile.max_installment_months:
-                continue
-            schedule = _installment_schedule(opt)
-            if schedule[-1][0] > desired:
-                continue
-            timeline = simulate_balance(state, forecast_days, extra_payments=schedule)
-            min_balance = min(b for _, b in timeline)
-            if min_balance < profile.minimum_balance_to_keep:
-                continue
-            candidates.append(
-                PlanCandidate("installments", "affordable_with_plan", tuple(schedule), (), opt.payment_option_id)
-            )
+    eligible_installments = _eligible_installment_options(state, request, payment_options)
+    for opt, schedule in eligible_installments:
+        timeline = simulate_balance(state, forecast_days, extra_payments=schedule)
+        if min(b for _, b in timeline) < profile.minimum_balance_to_keep:
+            continue
+        candidates.append(
+            PlanCandidate("installments", "affordable_with_plan", schedule, (), opt.payment_option_id)
+        )
 
     if (
         "full_payment" in methods
@@ -230,6 +276,23 @@ def generate_candidates(
                 "wait", "affordable_later", ((forecast_result.earliest_date_for_full_payment, amt),), (), None
             )
         )
+
+    # Installments combined with spending changes (DECISIONS.md #14). Only
+    # searched when nothing else is safe: `_rank_key` puts any change-requiring
+    # candidate strictly behind every no-change one, so a candidate from here
+    # could never outrank an existing one anyway -- gating on an empty candidate
+    # list makes that guarantee structural instead of relying on the ranking,
+    # and skips a 1-to-3-item combinatorial search that could not change the
+    # answer.
+    if not candidates:
+        found = find_installment_with_spending_changes(state, eligible_installments, events_by_id, forecast_days)
+        if found is not None:
+            changes, opt, schedule = found
+            candidates.append(
+                PlanCandidate(
+                    "installments", "affordable_with_plan", schedule, changes, opt.payment_option_id
+                )
+            )
 
     return candidates
 

@@ -714,3 +714,113 @@ no confirmed-event overlap at all, and `request_100`'s overlap is a
 suppress. A future reader should not reopen entry 12's gap expecting this to
 be the explanation -- it accounts for 2 of 21, and the other 19 remain
 accumulated forecasting uncertainty rather than a single findable bug.
+
+## 14. Spending changes were only ever combined with full_payment, never with installments
+
+**Gap.** `problem_statement.md` defines `affordable_with_plan` as the full
+requested amount being completed "using a partial payment schedule,
+installments, or permitted spending changes." That wording never restricts
+spending changes to a same-day full payment. But `generate_candidates` in
+`plans.py` only called `find_spending_changes` inside its `full_payment`
+branch -- installments and `partial_payment` were never tried in combination
+with a `stop` or `reduce_to`, even though `_eligible_spending_changes`
+already built a pool that respects the user's own protect / willing-to-stop
+/ willing-to-reduce preferences. A user who could safely afford a supplied
+installment plan *if* they paused one subscription was told
+`not_recommended`.
+
+**Fix.** A new `find_installment_with_spending_changes` search: smallest
+combination (1, then 2, then 3, capped by the output contract) of eligible
+changes that makes some eligible installment schedule safe, checking the
+schedule's own safety via `simulate_balance` against the modified state
+rather than a lump sum. Kept as its own search rather than unified with the
+full-payment one, since the safety condition being tested is genuinely
+different (a multi-date schedule versus a single same-day payment). The
+installment eligibility gates (user accepts installments, fits
+`max_installment_months`, last payment on or before
+`desired_completion_date`) were extracted into
+`_eligible_installment_options` so both installment paths share one
+definition and cannot drift apart.
+
+The new search runs only when no other candidate exists. `_rank_key`
+already puts any change-requiring candidate strictly behind every no-change
+one, so a candidate from here could never outrank an existing one anyway --
+gating on an empty candidate list makes that guarantee structural instead of
+dependent on the ranking, and skips a combinatorial search that could not
+change the answer.
+
+**`partial_payment` combined with spending changes was tested the same way
+and adds nothing.** 14 currently-`not_recommended` rows were eligible to try
+it (request allows partial payment, user accepts it, non-empty change pool);
+zero produced a newly valid two-payment plan. Not implemented, because it
+would be dead code.
+
+**Measured impact**, full 250-row diff by `request_id` against the prior
+committed `output.csv`:
+
+| | before | after |
+| --- | --- | --- |
+| `not_recommended` / `not_affordable` | 91 | 76 |
+| `installments` | 37 | 52 |
+| `affordable_with_plan` | 51 | 66 |
+| `full_payment` / `wait` / `partial_payment` | 65 / 49 / 8 | 65 / 49 / 8 |
+
+Exactly 15 rows changed, all `not_affordable`/`not_recommended` ->
+`affordable_with_plan`/`installments`: `request_53`, `request_59`,
+`request_89`, `request_100`, `request_107`, `request_109`, `request_118`,
+`request_131`, `request_139`, `request_148`, `request_149`, `request_154`,
+`request_163`, `request_174`, `request_217`. The other **235 rows are
+byte-identical**, and zero rows moved to a worse affordability status --
+both verified mechanically, not spot-checked.
+
+**Validation.** Sample harness (`--validate`) run before and after against
+the committed `plans.py` (restored from `HEAD`, then hash-verified back):
+`affordability_status` 18/25 -> **19/25**, `recommended_payment_method`
+19/25 -> **20/25**, `payment_plan` 18/25 -> **19/25**, with
+`amount_safe_to_pay` (8/25) and `earliest_date_for_full_payment` (19/25)
+unchanged as expected -- neither depends on plan selection. The improved row
+is `request_17`, whose ground-truth answer is an installment plan: we now
+produce `2026-03-01:95194.67|2026-03-31:95194.67|2026-04-30:95194.67`,
+character-for-character the sample's own expected plan. Worth stating
+plainly: ground truth reaches that plan with `spending_changes_needed` of
+`none` while we need two stops, because our forecast is 0.26% more
+pessimistic than theirs on that row -- the same residual calibration gap as
+entry 12. We land on the right plan, asking the user to give up slightly
+more than strictly necessary.
+
+Three new plans (`request_53`/`payment_option_145`,
+`request_139`/`payment_option_395`, `request_174`/`payment_option_494`) were
+reconstructed directly from `request_payment_options.csv` and match
+exactly on payment count, amount, and every date; every spending change
+across all 15 was independently re-checked against the user's own profile
+(category in their willing-to-stop or willing-to-reduce list, never in
+`expense_categories_to_protect`, correct flexibility flag, and every
+`reduce_to` sitting exactly on the event's `minimum_allowed_amount` floor).
+Output-contract sweep across all 250 rows: 0 violations, max 3 changes on
+any row, fail-open fallback count still 0/250.
+
+### Rejected: extending the same idea to `wait` / `affordable_later`
+
+The same combination search could let a spending change pull
+`earliest_date_for_full_payment` on or before `desired_completion_date`
+where the unmodified forecast doesn't. Tested: 31 rows eligible, **2 newly
+rescuable** (`request_33`, `request_137`). **Not implemented**, for a
+specific reason rather than a stylistic one.
+
+`problem_statement.md` defines `earliest_date_for_full_payment` as "the
+first date the full amount passes the safety check **without optional
+spending changes**." Using a spending change to move that date would make
+the row internally contradictory: either report the unmodified date, which
+then disagrees with the payment date the plan actually depends on, or report
+the modified one, which contradicts the field's own definition. Hypothesis 1
+has no such conflict -- an installment schedule comes from the supplied
+payment option and is independent of that field entirely.
+
+Two supporting reasons: the spec ties spending changes to
+`affordable_with_plan` specifically and never to `affordable_later`; and all
+6 `wait` rows in `sample_requests.csv` carry `spending_changes_needed` of
+`none`. Telling a user to permanently stop a subscription today so that a
+later lump sum clears is also a materially different ask than "wait."
+Two rescued rows is not worth contradicting a field definition -- the
+fail-closed posture from entry 8, applied to the rules themselves rather
+than just to the numbers.
