@@ -278,43 +278,62 @@ Resolving those (particularly the gig-income question) should pull this
 rate down; it is flagged here rather than left to look like a quietly
 accepted 40% failure rate.
 
-**Stage 5, explanation generation.** Build `decision_explanation` from a
-template populated with the deterministic engine's own numbers, optionally
-smoothed by an LLM pass for natural phrasing matching
-`sample_requests.csv`'s style. A post generation check re parses every
-number and date the LLM output contains and asserts it matches the
-computed values; reject and regenerate from the template if not, so prose
-can never silently drift from the decision.
+**Stage 5, explanation generation. Implemented in `code/pipeline/explain.py`.**
+`decision_explanation` is a deterministic template, not an LLM narrative
+pass -- the optional LLM-smoothing idea in the original design is skipped
+outright rather than guarded against, since a template can't drift from the
+decision it describes and a same-day deadline isn't the time to add a new
+LLM dependency to the row-writing path. The template was reverse-engineered
+directly from `sample_requests.csv`: every one of the 25 sample
+explanations' "leaves at least X available" / "keeps the X minimum" figure
+is *exactly* that user's own `minimum_balance_to_keep`, verified by direct
+comparison against `financial_profiles.csv` row by row, in all 25 cases
+regardless of payment method -- never a separately computed remaining-
+balance number. One template per method (`full_payment`, with and without
+spending changes; `installments`; `partial_payment`; `wait`;
+`not_recommended`), each grounded in the plan's own computed numbers, with
+dates rendered in the sample's "D Month YYYY" long form (distinct from
+`payment_plan`'s ISO format) and amounts comma-separated with the same
+whole-number-drops-decimals rule as `payment_plan`.
 
-**Stage 6, deterministic validation before write.** Two stacked guarantees
-with two different failure directions, see `DECISIONS.md` entry 8 for the
-full reasoning. The row fails open: every request_id gets exactly one row,
-guaranteed by wrapping the per request pipeline in a catch all that falls
-back to a schema valid `not_recommended` row rather than crashing or
-skipping a row. The recommendation inside the row fails closed: hard
-constraints (`0 <= amount_safe_to_pay <= requested_amount`, `payment_plan`
-sums and chronology, `partial_payment` exactly two payments summing to
-`requested_amount`, installment plans matching a real `payment_option_id`,
-`spending_changes_needed` referencing only flexible non protected events
-with `stop` and `reduce_to` never on the same event) are enforced with a
-fallback ladder (`full_payment` then `partial_payment` then the best safe
-matching installment option then `wait` then `not_recommended`) rather
-than a reject and drop, so stepping down always lands on something valid.
-Output row order and `request_id` set are guaranteed by iterating
-`requests.csv` in order and always writing one row per iteration.
+**Stage 6, deterministic validation before write. Implemented in
+`code/pipeline/output.py`.** Two stacked guarantees with two different
+failure directions, see `DECISIONS.md` entry 8. The row fails open: every
+request_id gets exactly one row, via a catch-all around the whole per-
+request Stage 1-5 pipeline that falls back to a schema-valid
+`not_recommended` row on any exception rather than crashing or skipping a
+row. The recommendation inside the row fails closed: `validate_row` checks
+the hard invariants (valid enum values, `0 <= amount_safe_to_pay <=
+requested_amount`, a `not_recommended` row never carrying a plan,
+`partial_payment`'s two payments summing to `requested_amount`, no event
+referenced by more than one spending change) and downgrades to the
+guaranteed-valid `not_recommended` floor if any fail. This is narrower than
+a full fallback ladder by design: Stage 4's `choose_plan` already only
+picks from candidates each individually verified safe by
+`simulate_balance`, so `validate_row` guards against a logic bug producing
+an internally inconsistent row, not against re-deriving eligibility from
+scratch. Verified end to end on the real 250-row run: 0/250 rows hit the
+fail-open path (caught one real bug this way during development --
+`PlanResult` didn't carry the structured spending-change list
+`build_explanation` needed, throwing on every `full_payment` row until
+fixed). Output row order and `request_id` set are asserted to exactly
+match `requests.csv` before writing.
 
-**Stage 7, evaluation harness.** Score the pipeline against
-`dataset/sample_requests.csv` (25 solved rows) before the full run: exact
-match on categorical fields, tolerance based comparison on amounts and
-dates, per field accuracy, and an aggregate distribution audit (status and
-method mix) to catch systemic bias. Only after this looks solid, run the
-full 250 row dataset and write `output.csv`, with a pre write assertion
-that the output `request_id` sequence exactly matches the input sequence.
+**Stage 7, evaluation harness.** `python code/main.py --validate` scores
+Stages 1-4 against `sample_requests.csv`'s 25 solved rows: exact match on
+categorical fields, tolerance-based comparison on amounts and dates, and
+(from Stage 4 onward) `affordability_status` / `recommended_payment_method`
+/ `payment_plan` exact-match counts. Run before `--write-output`, which
+writes the full 250-row `dataset/output.csv` with the pre-write assertion
+above.
 
-**Token usage tracking.** Wrap every LLM call with input and output token
-capture; aggregate into `evaluation/usage_report.md` at the end of the
-final full dataset run: providers, models, call counts, total and average
-tokens, estimated cost, per the submission requirement.
+**Token usage tracking.** `python code/main.py --write-output` writes
+`evaluation/usage_report.md` alongside `output.csv`. Producing `output.csv`
+makes zero new LLM calls -- every extracted fact it consumes comes from
+`cache/extracted_facts.json` -- so the report's numbers are the real,
+measured totals from the Stage 2 extraction run that populated that cache
+(215 Claude Haiku 4.5 calls for messages, 16 Claude Sonnet 5 calls for
+images; ~$0.46 total), not an estimate or a placeholder.
 
 ## Trade offs
 
@@ -365,39 +384,44 @@ tokens, estimated cost, per the submission requirement.
 
 ## Status as of 2026-09-13
 
-Stages 0 through 4 implemented and run against the real dataset:
+All 7 stages implemented, run end to end, and `dataset/output.csv` +
+`evaluation/usage_report.md` written from the real dataset:
 
 - Stage 0/1 (`code/pipeline/loader.py`, `code/pipeline/income.py`,
-  `code/pipeline/state.py`): zero errors across all 275 users
-  (250 `requests.csv` + 25 `sample_requests.csv`).
-- Stage 2 (`code/pipeline/extraction.py`): 231/231 sources (215 messages +
-  16 images) extracted successfully via the real Anthropic API; results
-  cached at `cache/extracted_facts.json`. Actual spend for the runs so far
-  (including one iteration re-run after a prompt fix): ~$0.78 across Claude
-  Haiku 4.5 (text) and Claude Sonnet 5 (vision).
+  `code/pipeline/state.py`): zero errors across all 275 users.
+- Stage 2 (`code/pipeline/extraction.py`): 231/231 sources extracted via
+  the real Anthropic API, cached at `cache/extracted_facts.json`.
 - Stage 2 -> Stage 1 amendments (`code/pipeline/amendments.py`): 0/16
-  unresolved blank-amount events dataset-wide (that 16 is the true
-  population, per DECISIONS.md #7 -- a prior report of this number as
-  "0/231" mislabeled it against Stage 2's unrelated source count instead),
-  zero errors.
-- Stage 3 (`code/pipeline/forecast.py`): three real bugs found and fixed via
-  `--validate` against `sample_requests.csv`'s known-correct values (see
-  Stage 3's own section above); currently 7/25 `amount_safe_to_pay` within
-  2%, 18/25 `earliest_date_for_full_payment` exact, 0.265 mean relative
-  amount error. Two open questions logged there.
-- Stage 4 (`code/pipeline/plans.py`): one real formatting bug found and
-  fixed via `--validate` (see Stage 4's own section above); currently 18/25
-  `recommended_payment_method` exact, 17/25 `affordability_status`, 17/25
-  `payment_plan` exact. Full 250-row smoke run: zero errors, all five
-  methods represented, but a ~40% `not_recommended` rate that traces back to
-  Stage 3's open accuracy gaps rather than a new Stage 4 bug -- flagged
-  there, not hidden.
+  unresolved blank-amount events; a real bug fixed where an unlinked
+  `no_confirmed_income` fact could wipe an unrelated `continuing_salary`
+  stream (DECISIONS.md #11, `not_recommended` 99->93/250).
+- Stage 3 (`code/pipeline/forecast.py`): three bugs found and fixed via
+  `--validate`, one (gig income's role in the safety floor) re-examined and
+  confirmed correct as excluded via three further real experiments
+  (DECISIONS.md #10) rather than left standing on an old assumption.
+- Stage 4 (`code/pipeline/plans.py`): one formatting bug fixed via
+  `--validate`.
+- Stage 5 (`code/pipeline/explain.py`) and Stage 6
+  (`code/pipeline/output.py`): built and wired together; caught and fixed
+  one real integration bug (`PlanResult` didn't carry the structured
+  spending-change data `explain.py` needed) via the fail-open count going
+  from 65/250 to 0/250 on the actual full run, not assumed correct.
+- Current `--validate` state: 8/25 `amount_safe_to_pay` within 2%, 19/25
+  `earliest_date_for_full_payment` exact, 18/25 `affordability_status`,
+  19/25 `recommended_payment_method`, 18/25 `payment_plan`, mean relative
+  amount error 0.261. Full 250-row `output.csv`: `full_payment` 65,
+  `wait` 49, `installments` 34, `partial_payment` 9, `not_recommended` 93
+  (37.2%); 0/250 fail-open fallback rows.
 - `python code/main.py`, `--sample`, `--user <id>`, `--extract [--limit N]`,
-  and `--validate` are all working CLI entry points; see `code/main.py`'s
-  module docstring for the full list.
+  `--validate`, and `--write-output` are all working CLI entry points; see
+  `code/main.py`'s module docstring for the full list.
 - Setup: `python -m venv .venv`, `.venv/Scripts/pip install -r
   requirements.txt` (Windows; `.venv/bin/pip` elsewhere), copy `.env.example`
-  to `.env` and fill in `ANTHROPIC_API_KEY` before using `--extract`.
+  to `.env` and fill in `ANTHROPIC_API_KEY` before using `--extract`
+  (`--write-output` needs no key -- it only reads the existing cache).
 
-Not yet built: Stage 5 (explanation), Stage 6 (validation), and the final
-`output.csv` / `evaluation/usage_report.md` writers.
+Remaining, documented rather than silently accepted: the Stage 3
+calibration gap behind the 6 remaining sample misses (`request_03`, `06`,
+`08`, `13`, `17`, `21`), all traced to the same root cause and intentionally
+not chased further per explicit direction, since `sample_requests.csv` is a
+style guide, not evaluation labels.

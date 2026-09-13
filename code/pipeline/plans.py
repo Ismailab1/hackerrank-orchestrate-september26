@@ -63,6 +63,7 @@ class PlanResult:
     recommended_payment_method: str
     payment_plan: str
     spending_changes_needed: str
+    spending_changes: tuple[SpendingChange, ...] = ()
 
 
 def _fixed_occurrence_dates(r: RecurringFixed, start: date, end: date) -> list[date]:
@@ -289,4 +290,5 @@ def choose_plan(
         recommended_payment_method=best.method,
         payment_plan=_format_payment_plan(best.payments),
         spending_changes_needed=_format_spending_changes(best.spending_changes),
+        spending_changes=best.spending_changes,
     )

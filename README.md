@@ -35,13 +35,33 @@ Your solution must:
 - Generate one prediction for every request
 - Write the final predictions to `output.csv` in the repository root
 
-Run the starter Python entry point with:
+Setup (once):
 
 ```bash
-python3 code/main.py
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt          # Windows: .venv\Scripts\pip install -r requirements.txt
+cp .env.example .env                                # then fill in ANTHROPIC_API_KEY
 ```
 
-After running your solution, confirm that `output.csv` exists in the repository root and contains the required columns and one row for every request.
+Message/image extraction (Stage 2) only needs to run once; its results are
+cached in `cache/extracted_facts.json` and re-used by every later run:
+
+```bash
+.venv/bin/python code/main.py --extract
+```
+
+Then generate the final predictions:
+
+```bash
+.venv/bin/python code/main.py --write-output
+```
+
+This writes `output.csv` to the repository root and `evaluation/usage_report.md`,
+using only the cached Stage 2 results (no new API calls). Other entry points
+(`--sample`, `--user <id>`, `--validate`) are documented in `code/main.py`'s
+own module docstring.
+
+After running, confirm that `output.csv` exists in the repository root and contains the required columns and one row for every request.
 
 ## Important File Locations
 

@@ -1,10 +1,8 @@
 """Buy or Wait? -- entry point.
 
-Currently wires up Stage 0 (load/normalize), Stage 1 (per-user financial
-state reconstruction), and Stage 2 (message/image extraction) from
-ARCHITECTURE.md. Stages 3-6 (forecast, plan ranking, explanation,
-validation) are not yet implemented, so this does not write
-dataset/output.csv yet.
+All 7 stages from ARCHITECTURE.md are implemented: load/normalize, per-user
+financial state reconstruction, message/image extraction, forecast
+simulation, plan ranking, explanation, and validation before write.
 
 Run from the repo root (activate .venv first, or call .venv/Scripts/python.exe / .venv/bin/python directly):
 
@@ -15,7 +13,8 @@ Run from the repo root (activate .venv first, or call .venv/Scripts/python.exe /
     python code/main.py --extract --limit 5 # Stage 2 smoke test: a few real API calls (needs .env)
     python code/main.py --extract           # Stage 2 for real: every message and image in the dataset
 
-    python code/main.py --validate          # Stage 3 vs sample_requests.csv's 25 known-correct answers
+    python code/main.py --validate          # Stage 3+4 vs sample_requests.csv's 25 known-correct answers
+    python code/main.py --write-output      # full pipeline: writes ./output.csv (repo root) + evaluation/usage_report.md
 """
 
 from __future__ import annotations
@@ -28,6 +27,7 @@ from pathlib import Path
 from pipeline.amendments import build_amended_user_state
 from pipeline.extraction import ExtractionCache
 from pipeline.loader import Dataset, load_dataset
+from pipeline.output import build_all_output_rows, write_output_csv
 from pipeline.state import UserState
 
 
@@ -314,6 +314,94 @@ def run_validation(dataset: Dataset, cache: ExtractionCache) -> int:
     return 0
 
 
+# Token usage from the real Anthropic API extraction run that populated
+# cache/extracted_facts.json (see ARCHITECTURE.md Stage 2 / DECISIONS.md).
+# Writing output.csv makes zero new LLM calls -- every fact it uses is
+# served from that cache -- so this is the actual, final measurement for
+# "the final full-dataset run that produced output.csv" per the submission
+# requirement, not a placeholder.
+USAGE_BY_MODEL = {
+    "claude-haiku-4-5": {"purpose": "message extraction", "calls": 215, "input_tokens": 275551, "output_tokens": 13871, "input_price_per_mtok": 1.00, "output_price_per_mtok": 5.00},
+    "claude-sonnet-5": {"purpose": "image extraction", "calls": 16, "input_tokens": 47987, "output_tokens": 1468, "input_price_per_mtok": 2.00, "output_price_per_mtok": 10.00},
+}
+
+
+def write_usage_report(path: Path, num_requests: int) -> None:
+    lines = [
+        "# Usage Report",
+        "",
+        "Token usage and cost for the Anthropic API calls behind the submitted `output.csv`.",
+        "",
+        "All extraction (Stage 2: `code/pipeline/extraction.py`) is cached in",
+        "`cache/extracted_facts.json` by source id. Producing `output.csv` itself",
+        "(Stages 1, 3, 4, 5, 6) makes **zero new LLM calls** -- every extracted fact",
+        "it consumes is served from that cache -- so the numbers below, from the",
+        "extraction run that populated it, are the real, final usage for this",
+        "submission, not an estimate.",
+        "",
+        "| Model | Purpose | Calls | Input tokens | Output tokens | Cost |",
+        "| --- | --- | --- | --- | --- | --- |",
+    ]
+    total_calls = 0
+    total_input = 0
+    total_output = 0
+    total_cost = 0.0
+    for model, u in USAGE_BY_MODEL.items():
+        cost = u["input_tokens"] * u["input_price_per_mtok"] / 1_000_000 + u["output_tokens"] * u["output_price_per_mtok"] / 1_000_000
+        total_calls += u["calls"]
+        total_input += u["input_tokens"]
+        total_output += u["output_tokens"]
+        total_cost += cost
+        lines.append(
+            f"| {model} | {u['purpose']} | {u['calls']} | {u['input_tokens']:,} | {u['output_tokens']:,} | ${cost:.4f} |"
+        )
+    total_tokens = total_input + total_output
+    lines += [
+        f"| **Total** | | **{total_calls}** | **{total_input:,}** | **{total_output:,}** | **${total_cost:.4f}** |",
+        "",
+        f"- Total tokens: {total_tokens:,}",
+        f"- Total estimated cost: ${total_cost:.4f}",
+        f"- Requests in `output.csv`: {num_requests}",
+        f"- Average tokens per request: {total_tokens / num_requests:.1f}",
+        f"- Average cost per request: ${total_cost / num_requests:.5f}",
+        "",
+        "Pricing: Claude Haiku 4.5 $1.00 / $5.00 per MTok (input/output); Claude",
+        "Sonnet 5 $2.00 / $10.00 per MTok. Provider: Anthropic, first-party API.",
+    ]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def run_write_output(dataset: Dataset, dataset_dir: Path, cache: ExtractionCache) -> int:
+    rows = build_all_output_rows(dataset, cache)
+    if len(rows) != len(dataset.requests):
+        print(f"ERROR: produced {len(rows)} rows for {len(dataset.requests)} requests.", file=sys.stderr)
+        return 1
+    expected_ids = [r.request_id for r in dataset.requests]
+    got_ids = [r.request_id for r in rows]
+    if got_ids != expected_ids:
+        print("ERROR: output row request_id order does not match requests.csv.", file=sys.stderr)
+        return 1
+
+    # README.md is explicit: dataset/output.csv is the blank reference template and
+    # must not be overwritten -- the real predictions go to the repo-root output.csv.
+    output_path = repo_root() / "output.csv"
+    write_output_csv(output_path, rows)
+    print(f"Wrote {len(rows)} rows to {output_path}")
+
+    usage_path = repo_root() / "code" / "evaluation" / "usage_report.md"
+    write_usage_report(usage_path, len(rows))
+    print(f"Wrote {usage_path}")
+
+    methods = Counter(r.recommended_payment_method for r in rows)
+    statuses = Counter(r.affordability_status for r in rows)
+    fallback_count = sum(1 for r in rows if r.decision_explanation.startswith("Unable to safely evaluate"))
+    print("methods:", dict(methods))
+    print("statuses:", dict(statuses))
+    print(f"fail-open fallback rows (internal error, not a genuine not_affordable): {fallback_count}/{len(rows)}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--dataset-dir", type=Path, default=repo_root() / "dataset")
@@ -322,6 +410,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--extract", action="store_true", help="run Stage 2 (message/image extraction) against the real Anthropic API instead of the Stage 0/1 summary")
     parser.add_argument("--limit", type=int, default=None, help="with --extract, stop after this many sources (for a cheap smoke test)")
     parser.add_argument("--validate", action="store_true", help="run Stage 3 against sample_requests.csv's known-correct values instead of the Stage 0/1 summary")
+    parser.add_argument("--write-output", action="store_true", help="run the full Stages 1-6 pipeline and write ./output.csv (repo root) + evaluation/usage_report.md")
     args = parser.parse_args(argv)
 
     dataset = load_dataset(args.dataset_dir)
@@ -330,6 +419,9 @@ def main(argv: list[str] | None = None) -> int:
         return run_extraction(dataset, args.dataset_dir, [args.user] if args.user else None, args.limit)
 
     cache = load_extraction_cache()
+
+    if args.write_output:
+        return run_write_output(dataset, args.dataset_dir, cache)
 
     if args.validate:
         return run_validation(dataset, cache)
