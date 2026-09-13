@@ -541,3 +541,95 @@ trace to the same already-documented Stage 3 calibration gap, and
 further out of 25 rows this close to the deadline risks tuning to noise.
 Next: Stage 5 (`decision_explanation`), Stage 6 (validation), and the
 `output.csv` / `evaluation/usage_report.md` writers.
+
+## 12. The near-miss installment cases: two hypotheses tested, both dead, decision left as declined
+
+**The shape of the problem.** Of the 93 `not_recommended` rows in the full
+250-row run, **21 have a fully compliant installment option that misses the
+safety check by 15% or less of that user's `minimum_balance_to_keep`, and 8
+of those miss by under 2%** (reproduced independently before investigating,
+not taken on faith). The tightest is `request_53`, short by **$17.02 against
+a $2,100 minimum** -- 0.81%. In every one of the 21, a *longer* installment
+option would have been safe, but exceeds the user's own
+`max_installment_months`, so it is correctly ineligible (entry in
+ARCHITECTURE.md Stage 4).
+
+This is not a new bug. It is the same Stage 3 calibration gap open since the
+first `--validate` run, concentrated exactly where it flips a real decision.
+A blanket correction was ruled out before starting: the gap has **no
+consistent direction** (`request_04` computes high against ground truth,
+`request_25` computes low), so any global margin would fix some of these 21
+and break currently-correct rows elsewhere. No global adjustment, buffer, or
+tolerance was added in this pass.
+
+**Hypothesis 1 -- obligation stacking (DECISIONS.md #2) is mis-reserving
+something.** Tested on `request_53`, the tightest case in the dataset:
+traced user_53's day-by-day 90-day balance with `payment_option_145`'s
+schedule layered on, then checked every reserved obligation against the raw
+`financial_events.csv` rows.
+
+*Falsified.* Every obligation is reserved at the exact amount and exact date
+the raw data supports: rent 774.00 day 2, utilities 162.58 day 6, education
+169.00 day 8, debt_repayment (vehicle loan) 463.00 day 11 (all 5 historical
+occurrences are exactly 463), music_subscription 36.00 day 11,
+delivery_membership 41.00 day 13. No installment is already in progress. The
+user has exactly one non-settled row in the entire window, and it is a
+*credit*. An independent hand recomputation of the trough balance from first
+principles (start 3,523.42, minus 4,000.16 fixed, plus 5,760.00 income,
+minus 1,178.12 installments, minus 2,022.16 irregular drain) reproduces the
+simulator's 2,082.98 to **0.000000** difference. Nothing is being
+double-counted, mis-dated, or mis-sized.
+
+**Hypothesis 2 -- irregular-essential daily-rate window edge / off-by-one.**
+Tested on `request_100` (short 453.63) and `request_148` (short 82.67), the
+next two tightest, plus `request_53`.
+
+*Falsified.* Drain days applied exactly equals days elapsed to the trough in
+all three cases -- 68/68, 69/69, 7/7 -- and the manual recomputation matches
+the simulator to 0.000000 in all three. There is no off-by-one at either
+window edge. (Day 0 deliberately carries no drain, since
+`current_available_balance` is a snapshot that already reflects today's
+spending; moving drain onto day 0 would only lower balances further.)
+
+**The one real modeling detail found, and why it is not the fix.** The
+irregular rate divides total settled spend by a fixed **180-day** divisor
+while the actual data span is **176 days** (in all three traced cases; 175-179
+universally per entry 1). So the drain is under-estimated by ~2.2%, making
+the forecast slightly *optimistic*. Correcting it therefore moves every
+near-miss in the **wrong** direction, measured rather than assumed:
+
+| case | shortfall now | with a true 176-day divisor |
+| --- | --- | --- |
+| `request_53` | 17.02 | 62.98 (worse by 45.96) |
+| `request_100` | 453.63 | 1,269.88 (worse by 816.25) |
+| `request_148` | 82.67 | 147.04 (worse by 64.36) |
+
+It is also exactly the kind of global recalibration this pass ruled out up
+front. Not applied.
+
+**A partial explanation that does not generalize.** `request_53`'s entire
+17.02 gap is smaller than a 230.40 pending merchant refund settling
+2025-11-14, inside the window -- money the spec *explicitly forbids
+counting* ("do not count pending credits, bonuses, commissions, refunds ...
+until they settle"). So that specific decline is the rules working as
+written, not a calibration error. Checked across all 21: an excluded pending
+credit alone would close the gap in only **2 of 21** (`request_53`,
+`request_149`). Real, but not the general cause.
+
+**Decision.** Neither hypothesis produced a concrete root cause, so nothing
+was changed -- no code was touched in this pass, and the before/after
+numbers are therefore identical by construction: **21 near-miss cases, 8
+under 2%, 93 `not_recommended` of 250, both before and after.** The
+remaining gap is genuine estimator variance in a 90-day forecast built from
+~176 days of history, not a locatable defect.
+
+Leaving these 21 as declined is the correct outcome rather than a
+concession. The alternative -- loosening the `minimum_balance_to_keep`
+check, or adding a tolerance to let a 0.81% miss through -- would mean
+recommending a payment plan the system's own best estimate says breaks the
+one hard guarantee the user actually specified, on the strength of the
+estimate being *nearly* good enough. That is precisely the fail-closed
+direction established in entry 8 and reinforced in entries 9, 10, and 11: a
+stream, a fact, or a plan stands on its own evidence, and when the evidence
+lands this close to the line the system declines rather than gambles with
+someone's rent money.
