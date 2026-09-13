@@ -22,8 +22,14 @@ path as any other structured row. Two amendment shapes:
    classification logic (continuing vs transitional_end vs gig) applies to
    it unchanged -- `"Next confirmed salary"` for an employer amount/date
    change, `"Independent work payment"` (a GIG description) for a
-   service_provider one, `"Final employer payroll"` (TRANSITIONAL_END) for
-   an explicit no-confirmed-income statement.
+   service_provider one.
+
+`no_confirmed_income` facts are deliberately never synthesized into
+anything (DECISIONS.md #11): every real one in this dataset is a vague,
+unlinked message with no target_event_id telling us which income source it
+is actually about, and a synthetic TRANSITIONAL_END row would zero the
+user's entire continuing_salary stream regardless of which source ended --
+wrong whenever more than one exists, which most of the real cases have.
 """
 
 from __future__ import annotations
@@ -96,7 +102,7 @@ def _most_recent_continuing_amount(events: list[Event]) -> float | None:
 
 
 def _synthesize_income_events(
-    events: list[Event], facts: list[ExtractedFact], profile, as_of_date, fx, messages_by_id
+    events: list[Event], facts: list[ExtractedFact], profile, fx, messages_by_id
 ) -> list[Event]:
     synthetic: list[Event] = []
     for fact in facts:
@@ -113,26 +119,20 @@ def _synthesize_income_events(
             continue
         source = message["source_type"]
 
-        if fact.fact_type == "no_confirmed_income":
-            synthetic.append(
-                Event(
-                    event_id=f"{_SYNTHETIC_PREFIX}{fact.source_id}",
-                    user_id=fact.user_id,
-                    event_type="income",
-                    description="Final employer payroll",  # TRANSITIONAL_END: correctly zeroes the continuing stream
-                    category="salary",
-                    direction="credit",
-                    amount=0.0,  # never read: TRANSITIONAL_END short-circuits before amount use
-                    currency=profile.home_currency,
-                    event_date=as_of_date,
-                    settlement_date=as_of_date,
-                    status="settled",
-                    linked_event_id=None,
-                    flexibility="fixed",
-                    minimum_allowed_amount=None,
-                )
-            )
-            continue
+        # no_confirmed_income is deliberately never synthesized here (DECISIONS.md
+        # #11): this function only ever sees target-less facts (the filter at the
+        # top of this loop), and every real no_confirmed_income fact in this
+        # dataset is a vague, unlinked message ("one household income source has
+        # ended") with no structured link to which income source it's actually
+        # about. Synthesizing a TRANSITIONAL_END wipe from it zeroes the user's
+        # *entire* continuing_salary stream regardless of which source ended --
+        # wrong whenever the user has more than one, which 12 of the 16 real
+        # cases do (two of them, user_42 and user_58, even state a "remaining
+        # confirmed" salary in the same message that the wipe then discards).
+        # Same principle entry 9 established for base salary vs. commission: a
+        # stream stands on its own evidence, and something with no link to a
+        # specific source doesn't get to unsupportedly discard one that has
+        # perfectly good evidence of its own.
 
         if fact.fact_type not in ("amount_change", "date_change") or fact.date is None:
             continue
@@ -165,14 +165,12 @@ def _synthesize_income_events(
     return events + synthetic
 
 
-def apply_amendments(
-    events: list[Event], facts: list[ExtractedFact], profile, as_of_date, fx, messages_by_id
-) -> list[Event]:
+def apply_amendments(events: list[Event], facts: list[ExtractedFact], profile, fx, messages_by_id) -> list[Event]:
     """Returns an amended event list ready to pass into build_user_state.
     `facts` should already be filtered to this user (any order, any
     sanity-check status -- this function re-checks per fact)."""
     events = _patch_targeted_events(events, facts, profile, fx)
-    events = _synthesize_income_events(events, facts, profile, as_of_date, fx, messages_by_id)
+    events = _synthesize_income_events(events, facts, profile, fx, messages_by_id)
     return events
 
 
@@ -182,5 +180,5 @@ def build_amended_user_state(
     """Stage 1 + Stage 2 combined: the reconstructed state Stage 3 should
     actually forecast from."""
     facts = cache.facts_for_user(profile.user_id)
-    amended_events = apply_amendments(user_events, facts, profile, as_of_date, fx, messages_by_id)
+    amended_events = apply_amendments(user_events, facts, profile, fx, messages_by_id)
     return build_user_state(profile, amended_events, as_of_date, fx)

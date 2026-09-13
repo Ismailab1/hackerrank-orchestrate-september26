@@ -453,3 +453,91 @@ entry 7 already established as exactly 16. Re-verified directly:
 summing `unresolved_events` across all 275 per-user states gives exactly 0.
 The result -- 0/16, not 0/231 -- was already correct; only its write-up
 mislabeled the denominator.
+
+## 11. An unlinked "no confirmed income" message can't wipe a whole stream on a guess
+
+**Bug found.** `_synthesize_income_events` synthesized a `"Final employer
+payroll"` (TRANSITIONAL_END) event for every `no_confirmed_income` fact,
+unconditionally. That synthetic event was dated `as_of_date`, making it the
+most recent salary-category row for the user, so
+`_build_continuing_salary_stream` zeroed the user's *entire*
+`continuing_salary` stream because its own most recent record looked like
+a job ending. The problem: every real `no_confirmed_income` fact in this
+dataset is a vague, unlinked message (`target_event_id` is `None` for all
+16 of them, confirmed directly against `cache/extracted_facts.json`) --
+there is no structured link telling the pipeline which income source the
+message is actually about, yet the wipe applied to the whole stream
+regardless of how many sources the user actually has.
+
+**Confirmed before touching anything:** built state twice for each of the
+16 real `no_confirmed_income` users -- once with plain Stage 1 (no
+amendments), once with the full amended pipeline -- and compared whether a
+`continuing_salary` stream survived. 12 users had a real, independently
+evidenced stream in the plain build that disappeared once amendments ran:
+`user_12`, `user_133`, `user_201`, `user_213`, `user_237`, `user_241`,
+`user_262`, `user_265`, `user_29`, `user_42`, `user_58`, `user_61`. The
+other 4 (`user_111`, `user_165`, `user_246`, `user_75`) had no
+`continuing_salary` stream either way -- these genuinely have no other
+income, so the (former) wipe was harmless for them specifically.
+
+Two of the twelve make the bug unambiguous rather than merely plausible:
+`user_42`'s message (`message_30`) reads "One household employment record
+has ended. The remaining confirmed monthly salary is INR 148000" and
+`user_58`'s (`message_42`) says the same for IDR 25,840,000 -- both state a
+still-active income figure in the identical message the wipe was
+discarding. `user_262`'s message illustrates why fuzzy-matching the text to
+a specific structured description was rejected as the fix instead: it says
+"one household work income source has ended" without naming whether it
+means `Primary household salary` or `Second household income`, so guessing
+would only replace one wrong answer with a different one.
+
+**Decision.** In `_synthesize_income_events`, never synthesize a wipe event
+for a `no_confirmed_income` fact that has no `target_event_id` -- which, in
+this dataset, is all of them, so the branch was removed outright rather
+than left as a conditional that never fires. Same principle entry 9
+established for base salary vs. commission: a stream stands on its own
+evidence, and a fact with no structured link to a specific source doesn't
+get to unsupportedly discard a stream that has perfectly good evidence of
+its own. A cleaner long-run fix -- reclassifying these facts at extraction
+time so `no_confirmed_income` is reserved for messages that actually are
+unambiguous -- would need a Stage 2 re-run against the real API, not worth
+the remaining time before submission.
+
+**Re-verified after the fix**, same before/after methodology: all 12
+previously-wiped users now keep their real `continuing_salary` stream, and
+the 4 genuinely-empty cases are unaffected -- confirming the fix is neither
+too broad nor too narrow.
+
+**Measured effect:**
+
+| | before | after |
+| --- | --- | --- |
+| sample (`--validate`, 25 rows): `amount_safe_to_pay` within 2% | 7/25 | 8/25 |
+| sample: `earliest_date_for_full_payment` exact | 18/25 | 19/25 |
+| sample: `affordability_status` exact | 17/25 | 18/25 |
+| sample: `recommended_payment_method` exact | 18/25 | 19/25 |
+| sample: `payment_plan` exact | 17/25 | 18/25 |
+| sample: mean relative amount error | 0.265 | 0.261 |
+| full 250: `not_recommended` / `not_affordable` | 99 (39.6%) | 93 (37.2%) |
+| full 250: `full_payment` / `affordable_now` | 60 / 54 | 65 / 59 |
+| full 250: `installments` / `affordable_with_plan` | 33 / 48 | 34 / 49 |
+
+`request_12` (one of the twelve, and the one sample row this bug directly
+broke) now matches ground truth exactly on every field: `amount_safe_to_pay`
+65,164.00, `earliest_date_for_full_payment` 2026-04-05, `affordable_with_plan`,
+`installments` -- previously `not_recommended` with an empty income model
+despite `"Temporary assignment pay"` sitting in that user's own history with
+nothing suggesting it had ended.
+
+Six of the twelve fixed users flip to a real recommendation in the full
+250-row run (five to `full_payment`, one to `installments`); the other six
+remain `not_recommended` for unrelated reasons already covered by Stage 3's
+open questions, not this bug.
+
+Per direction from this point: no further Stage 3 accuracy chasing. The
+remaining sample misses (`request_03`, `06`, `08`, `13`, `17`, `21`) all
+trace to the same already-documented Stage 3 calibration gap, and
+`sample_requests.csv` is a style guide, not evaluation labels -- squeezing
+further out of 25 rows this close to the deadline risks tuning to noise.
+Next: Stage 5 (`decision_explanation`), Stage 6 (validation), and the
+`output.csv` / `evaluation/usage_report.md` writers.
