@@ -54,33 +54,30 @@ def _project_fixed_occurrences(state: UserState, end: date) -> list[CashEvent]:
 
 
 def _project_income_occurrences(state: UserState, end: date, already_confirmed: set[tuple]) -> list[CashEvent]:
-    """Skips an occurrence that exactly matches an existing confirmed_future_event
-    (a continuing_salary stream's next_date is sometimes literally that
-    user's own 'Next confirmed salary' scheduled row, which is already
-    counted there -- see ARCHITECTURE.md Stage 3 for why this can't just be
-    excluded at the source instead).
-
-    continuing_salary steps calendar-correct on the same day of month
-    (cadence_days=30 is a flat approximation that drifts a full day off the
-    real ~15th-of-month pattern within a couple of projected months -- caught
-    against sample_requests.csv, see ARCHITECTURE.md Stage 3). gig income has
-    no clean day-of-month pattern (DECISIONS.md #3), so its own detected
-    cadence_days is the right step for it."""
+    """Only continuing_salary is ever projected here; gig streams are
+    deliberately excluded from the hard 90-day safety floor (see
+    ARCHITECTURE.md Stage 3's own section for the full re-investigation:
+    re-tested by actually removing this exclusion and by crediting only a
+    stream's single next occurrence, both against the real sample data, not
+    reasoned about in the abstract -- both make the aggregate result worse,
+    and the two clearest counterexamples, user_09 and user_10, are both
+    gig-only-income users with well-evidenced streams, ruling out "only
+    exclude gig when other income exists" too. This project forward
+    calendar-correct on the same day of month (a flat cadence_days=30 step
+    drifts a full day off the real pattern within a couple of months --
+    caught against sample_requests.csv)."""
     events: list[CashEvent] = []
     for inc in state.income_streams:
         if inc.stream != "continuing_salary":
-            continue  # see module docstring: gig income is excluded from the hard safety floor
+            continue
         occ = inc.next_date
-        step = (lambda d: next_month_on_day(d, inc.next_date.day)) if inc.stream == "continuing_salary" else (
-            lambda d: d + timedelta(days=inc.cadence_days)
-        )
         while occ < state.as_of_date:
-            occ = step(occ)
+            occ = next_month_on_day(occ, inc.next_date.day)
         while occ <= end:
             key = (occ, round(inc.amount, 2), "salary", "credit")
             if key not in already_confirmed:
                 events.append(CashEvent(occ, inc.amount, "credit", "salary", inc.description, None, None))
-            occ = step(occ)
+            occ = next_month_on_day(occ, inc.next_date.day)
     return events
 
 
@@ -98,16 +95,22 @@ def build_forecast_events(state: UserState, forecast_days: int = FORECAST_DAYS) 
     return events
 
 
-def simulate_balance(state: UserState, forecast_days: int = FORECAST_DAYS) -> list[tuple[date, float]]:
+def simulate_balance(
+    state: UserState, forecast_days: int = FORECAST_DAYS, extra_payments: tuple[tuple[date, float], ...] = ()
+) -> list[tuple[date, float]]:
     """(date, balance_at_end_of_day) for every day from as_of_date to
-    as_of_date+forecast_days inclusive, starting from current_available_balance
-    and never including the request's own candidate payment -- that's
-    evaluated separately by compute_amount_safe_to_pay /
-    compute_earliest_full_payment_date below."""
+    as_of_date+forecast_days inclusive, starting from current_available_balance.
+    `extra_payments` layers a candidate plan's own debits (e.g. an
+    installment schedule) on top of the user's complete existing financial
+    position -- DECISIONS.md #2's obligation-stacking requirement applied to
+    Stage 4's plan safety checks, not just Stage 3's baseline lump sum."""
     events = build_forecast_events(state, forecast_days)
     events_by_date: dict[date, list[CashEvent]] = {}
     for e in events:
         events_by_date.setdefault(e.date, []).append(e)
+    extra_by_date: dict[date, float] = {}
+    for d, amount in extra_payments:
+        extra_by_date[d] = extra_by_date.get(d, 0.0) + amount
 
     daily_irregular_drain = sum(r.daily_rate for r in state.irregular_rates)
 
@@ -121,6 +124,7 @@ def simulate_balance(state: UserState, forecast_days: int = FORECAST_DAYS) -> li
             balance -= daily_irregular_drain
         for e in events_by_date.get(d, []):
             balance += e.amount if e.direction == "credit" else -e.amount
+        balance -= extra_by_date.get(d, 0.0)
         timeline.append((d, balance))
     return timeline
 

@@ -123,8 +123,12 @@ on the three real cases this produces: `user_02`'s salary raise
 (IDR 42,750,000 effective 2025-08-15), `user_07`'s payroll date move
 (2024-09-23, amount preserved from structured data), and `user_12`'s
 contract-ended message correctly zeroing their `continuing_salary` stream
-to `none`. Full-dataset re-run: 0/231 unresolved blank-amount events (down
-from 1, the FX case), zero errors across all 275 users.
+to `none`. Full-dataset re-run: 0/16 unresolved blank-amount events (the
+`231` figure elsewhere in this doc is Stage 2's total *source* count --
+215 messages + 16 images -- a different population; DECISIONS.md #7
+independently established 16 as the exact number of blank-amount rows in
+`financial_events.csv`, and that's the population this number is out of),
+zero errors across all 275 users.
 
 **Stage 3, ninety day forecast simulation, deterministic. Implemented in
 `code/pipeline/forecast.py`.** From `request_date`, project the balance
@@ -204,20 +208,75 @@ users. Remaining gaps are open, not silently accepted -- see below.
    rather than Stage 3 fully closing on its own), and edge effects in the
    irregular-essential daily-rate window.
 
-**Stage 4, plan candidate generation and ranking, deterministic.**
-Enumerate eligible candidates: `full_payment`, `partial_payment`, and
-`installments` (each gated on appearing in
-`payment_methods_user_will_consider`, and for installments, exactly
-matching a supplied `payment_option_id` and `max_installment_months`),
-`wait` (full payment becomes safe later and `full_payment` is accepted),
-spending change adjusted variants (`stop` or `reduce_to` on flexible,
-non protected events only, never combining a stop and a reduce on the same
-event), and `not_recommended` as the fallback when nothing safe qualifies.
-Filter to plans that pass the Stage 3 safety check throughout the
-forecast, then rank by the specified order: completes by
-`desired_completion_date`, then requires no spending changes, then
-minimizes total paid, then starts earlier, then uses fewer payments, then
-lowest `payment_option_id`.
+**Stage 4, plan candidate generation and ranking, deterministic.
+Implemented in `code/pipeline/plans.py`.** Enumerate eligible candidates:
+`full_payment`, `partial_payment`, and `installments` (each gated on
+appearing in `payment_methods_user_will_consider`, and for installments,
+exactly matching a supplied `payment_option_id` and `max_installment_months`
+-- `number_of_payments` doubles as the month count here since every real
+installment option in this dataset has a ~28-31 day frequency), `wait`
+(full payment becomes safe later and `full_payment` is accepted), a
+spending-change-adjusted `full_payment` variant (`stop` or `reduce_to` on
+flexible, non-protected events the user is willing to adjust -- `reduce_to`
+always floors at the event's own `minimum_allowed_amount`, which is
+populated for exactly every reducible-flagged row in the dataset -- never
+combining a stop and a reduce on the same event), and `not_recommended` as
+the fallback when nothing safe qualifies. `amount_safe_to_pay` and
+`earliest_date_for_full_payment` are already fully determined by Stage 3,
+independent of whichever plan wins here.
+
+Deadline handling is a hard gate here, not just the ranking tie-break the
+spec's own ordering implies: every candidate (partial_payment explicitly,
+and installments/`wait` by the same reading) is only generated if it
+completes by `desired_completion_date`, because `problem_statement.md`
+states as a requirement, not a preference, that "the plan must complete the
+request by desired_completion_date" -- and empirically, every `wait` row in
+`sample_requests.csv` has `earliest_date_for_full_payment` exactly equal to
+`desired_completion_date`, never later. This makes ranking tier 1 in the
+spec's own order ("completes by desired_completion_date") a no-op among the
+candidates generated here, since they've already all been filtered on it.
+
+The spending-change search (`find_spending_changes`) tries combinations of
+up to 3 adjustable recurring obligations (largest cash freed first),
+re-simulating each combination's actual effect on the min-balance -- not
+trusting a naive sum of freed cash, since an event dated after the
+balance's trough doesn't help it at all regardless of amount.
+
+Filter to plans that pass the Stage 3 safety check throughout the forecast
+(installments layer their own payment schedule on top of the user's
+complete existing position via `simulate_balance`'s `extra_payments`
+parameter, per DECISIONS.md #2), then rank by the specified order:
+completes by `desired_completion_date` (see above -- already satisfied by
+construction), then requires no spending changes, then minimizes total paid
+(this is where `installments`' financing fee naturally loses to a fee-free
+`full_payment`/`partial_payment` when both are safe), then starts earlier,
+then uses fewer payments, then lowest `payment_option_id`.
+
+Validated against `sample_requests.csv` (`python code/main.py --validate`,
+now checking `affordability_status`, `recommended_payment_method`, and
+`payment_plan` alongside Stage 3's two numbers). This caught one real Stage
+4 bug: `payment_plan` amounts were formatted with Python's `:g`, which
+flips to scientific notation for large amounts and strips the trailing
+zero the dataset's own convention keeps (`3246.10`, never `3246.1`) --
+fixed with a formatter matching that exact convention (whole numbers get no
+decimal point, everything else gets exactly two). After that fix: 18/25
+`recommended_payment_method` exact matches, 17/25 `affordability_status`,
+17/25 `payment_plan` (up from 12/25 pre-fix). Full 250-row smoke run: zero
+errors, all five methods represented (`full_payment` 60, `wait` 49,
+`installments` 33, `partial_payment` 9, `not_recommended` 99).
+
+That `not_recommended` rate (99/250, ~40%) is well above DECISIONS.md #8
+point 5's "a couple of percent" red-flag threshold. Tracing specific cases
+(e.g. `request_17`: an installment option matching the ground truth exactly
+misses the safety check by a small margin, `158,268` computed against a
+`166,100` requirement) shows this is inherited from Stage 3's own
+documented residual accuracy gaps flipping the categorical decision, not a
+new Stage 4 bug -- of the 6 sample rows where my status disagrees with
+ground truth, every one traces to a Stage 3 amount that was too pessimistic
+by roughly the same margin already logged in Stage 3's open questions.
+Resolving those (particularly the gig-income question) should pull this
+rate down; it is flagged here rather than left to look like a quietly
+accepted 40% failure rate.
 
 **Stage 5, explanation generation.** Build `decision_explanation` from a
 template populated with the deterministic engine's own numbers, optionally
@@ -306,7 +365,7 @@ tokens, estimated cost, per the submission requirement.
 
 ## Status as of 2026-09-13
 
-Stages 0 through 3 implemented and run against the real dataset:
+Stages 0 through 4 implemented and run against the real dataset:
 
 - Stage 0/1 (`code/pipeline/loader.py`, `code/pipeline/income.py`,
   `code/pipeline/state.py`): zero errors across all 275 users
@@ -316,14 +375,23 @@ Stages 0 through 3 implemented and run against the real dataset:
   cached at `cache/extracted_facts.json`. Actual spend for the runs so far
   (including one iteration re-run after a prompt fix): ~$0.78 across Claude
   Haiku 4.5 (text) and Claude Sonnet 5 (vision).
-- Stage 2 -> Stage 1 amendments (`code/pipeline/amendments.py`): 0/231
-  unresolved blank-amount events dataset-wide (down from 16), zero errors.
+- Stage 2 -> Stage 1 amendments (`code/pipeline/amendments.py`): 0/16
+  unresolved blank-amount events dataset-wide (that 16 is the true
+  population, per DECISIONS.md #7 -- a prior report of this number as
+  "0/231" mislabeled it against Stage 2's unrelated source count instead),
+  zero errors.
 - Stage 3 (`code/pipeline/forecast.py`): three real bugs found and fixed via
   `--validate` against `sample_requests.csv`'s known-correct values (see
   Stage 3's own section above); currently 7/25 `amount_safe_to_pay` within
   2%, 18/25 `earliest_date_for_full_payment` exact, 0.265 mean relative
-  amount error. Two open questions logged there for whoever continues into
-  Stage 4.
+  amount error. Two open questions logged there.
+- Stage 4 (`code/pipeline/plans.py`): one real formatting bug found and
+  fixed via `--validate` (see Stage 4's own section above); currently 18/25
+  `recommended_payment_method` exact, 17/25 `affordability_status`, 17/25
+  `payment_plan` exact. Full 250-row smoke run: zero errors, all five
+  methods represented, but a ~40% `not_recommended` rate that traces back to
+  Stage 3's open accuracy gaps rather than a new Stage 4 bug -- flagged
+  there, not hidden.
 - `python code/main.py`, `--sample`, `--user <id>`, `--extract [--limit N]`,
   and `--validate` are all working CLI entry points; see `code/main.py`'s
   module docstring for the full list.
@@ -331,6 +399,5 @@ Stages 0 through 3 implemented and run against the real dataset:
   requirements.txt` (Windows; `.venv/bin/pip` elsewhere), copy `.env.example`
   to `.env` and fill in `ANTHROPIC_API_KEY` before using `--extract`.
 
-Not yet built: Stage 4 (plan candidate generation and ranking), Stage 5
-(explanation), Stage 6 (validation), and the final `output.csv` /
-`evaluation/usage_report.md` writers.
+Not yet built: Stage 5 (explanation), Stage 6 (validation), and the final
+`output.csv` / `evaluation/usage_report.md` writers.

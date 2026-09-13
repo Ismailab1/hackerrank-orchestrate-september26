@@ -233,16 +233,20 @@ def run_extraction(dataset: Dataset, dataset_dir: Path, user_ids: list[str] | No
 
 
 def run_validation(dataset: Dataset, cache: ExtractionCache) -> int:
-    """Stage 7 (early): validate Stage 1+2+3 against sample_requests.csv's 25
-    known-correct amount_safe_to_pay / earliest_date_for_full_payment values,
-    per ARCHITECTURE.md's own plan to check here before the full 250-row run."""
+    """Stage 7 (early): validate Stage 1-4 against sample_requests.csv's 25
+    known-correct values, per ARCHITECTURE.md's own plan to check here
+    before the full 250-row run."""
     from pipeline.forecast import run_forecast
-    from pipeline.loader import parse_date
+    from pipeline.loader import Request, parse_date
+    from pipeline.plans import choose_plan
 
     AMOUNT_TOLERANCE = 0.02  # relative
     rows = dataset.sample_requests
     amount_hits = 0
     date_hits = 0
+    status_hits = 0
+    method_hits = 0
+    plan_hits = 0
     amount_errors = []
 
     for r in rows:
@@ -253,8 +257,24 @@ def run_validation(dataset: Dataset, cache: ExtractionCache) -> int:
         state = build_state_for_user(dataset, profile, as_of_date, cache)
         result = run_forecast(state, requested_amount)
 
+        request = Request(
+            request_id=r["request_id"],
+            user_id=user_id,
+            request_date=as_of_date,
+            request_type=r["request_type"],
+            requested_amount=requested_amount,
+            desired_completion_date=parse_date(r["desired_completion_date"]),
+            allows_partial_payment=r["allows_partial_payment"].strip().lower() == "true",
+            request_text=r["request_text"],
+        )
+        payment_options = dataset.payment_options_by_request.get(r["request_id"], [])
+        plan = choose_plan(state, request, payment_options, result, dataset.events_by_id)
+
         expected_amount = float(r["amount_safe_to_pay"])
         expected_date = r["earliest_date_for_full_payment"].strip() or None
+        expected_status = r["affordability_status"]
+        expected_method = r["recommended_payment_method"]
+        expected_plan = r["payment_plan"]
 
         rel_err = abs(result.amount_safe_to_pay - expected_amount) / max(expected_amount, 1.0)
         amount_ok = rel_err <= AMOUNT_TOLERANCE
@@ -265,17 +285,31 @@ def run_validation(dataset: Dataset, cache: ExtractionCache) -> int:
         date_ok = got_date_str == expected_date
         date_hits += date_ok
 
-        marker = "OK" if (amount_ok and date_ok) else "MISS"
+        status_ok = plan.affordability_status == expected_status
+        method_ok = plan.recommended_payment_method == expected_method
+        plan_ok = plan.payment_plan == expected_plan
+        status_hits += status_ok
+        method_hits += method_ok
+        plan_hits += plan_ok
+
+        marker = "OK" if (amount_ok and date_ok and status_ok and method_ok and plan_ok) else "MISS"
         print(
             f"{marker:4s} {r['request_id']:12s} user={user_id:9s} "
-            f"amount_safe_to_pay: got={result.amount_safe_to_pay:,.2f} expected={expected_amount:,.2f} "
-            f"| earliest_date: got={got_date_str} expected={expected_date}"
+            f"amount: got={result.amount_safe_to_pay:,.2f} exp={expected_amount:,.2f} "
+            f"| date: got={got_date_str} exp={expected_date} "
+            f"| status: got={plan.affordability_status} exp={expected_status} "
+            f"| method: got={plan.recommended_payment_method} exp={expected_method}"
         )
+        if not plan_ok:
+            print(f"     plan: got={plan.payment_plan!r} exp={expected_plan!r}")
 
     n = len(rows)
     print()
     print(f"amount_safe_to_pay within {AMOUNT_TOLERANCE:.0%}: {amount_hits}/{n}")
     print(f"earliest_date_for_full_payment exact match: {date_hits}/{n}")
+    print(f"affordability_status exact match: {status_hits}/{n}")
+    print(f"recommended_payment_method exact match: {method_hits}/{n}")
+    print(f"payment_plan exact match: {plan_hits}/{n}")
     print(f"mean relative amount error: {sum(amount_errors) / n:.3f}")
     return 0
 

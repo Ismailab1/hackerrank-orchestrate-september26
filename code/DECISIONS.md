@@ -345,3 +345,111 @@ The "no confirmed future income" count after the fix is exactly 7, matching
 entry 4's own empirical count of users whose most recent salary record is a
 genuine `Final employer payroll` ending with nothing after it -- confirming
 `none` no longer contains anything except real job endings.
+
+## 10. Re-testing the gig-income exclusion instead of assuming it, and closing the amendments FX gap on the other path
+
+**Question 1.** `forecast.py`'s `_project_income_occurrences` starts with
+`if inc.stream != "continuing_salary": continue` before a per-stream `step`
+function that branches on `inc.stream == "continuing_salary"` ever runs --
+so the gig branch of that function was dead code. The question raised: was
+the gig-income exclusion (entry logged in ARCHITECTURE.md's Stage 3
+section) actually re-validated after that per-stream step function was
+added, or was it left in place unexamined once a plausible-looking fix
+existed for it?
+
+**What was actually tested, in order, against the real 25-row sample set,
+not reasoned about in the abstract:**
+
+1. Printed what the (dead) gig branch would compute for `user_10` -- the
+   user whose 266,700-vs-12,700 overstatement originally justified the
+   exclusion -- with the exclusion still in place: 13 weekly occurrences at
+   40,977.52 each, a 532,707.76 projected total. This is the exact
+   computation that produced the original overstatement; the per-stream
+   step function changes nothing about it, because gig income was already
+   stepping by its own `cadence_days` before and after that function
+   existed (only `continuing_salary`'s stepping changed, from a flat
+   30-day approximation to calendar-correct). So the premise that a fix
+   was sitting unused was checked directly and is false for this case.
+2. Removed the `continue` outright and re-ran `--validate`: mean relative
+   amount error went from 0.265 to 0.991 -- `request_09` (a gig-only-income
+   user) fixes, but `request_10` reproduces its original overstatement
+   exactly and `request_11` (previously an exact match) breaks (`wait`
+   instead of `full_payment`, wrong date, wrong status). A net regression,
+   not a fix.
+3. Checked whether `user_10`'s `cadence_days=7` / `amount=40,977.52` are
+   themselves wrong (the second hypothesis offered: a bug in how those are
+   computed). They are not: the raw event history shows 21 real
+   occurrences at an almost exactly weekly cadence, rotating across four
+   different descriptions (`Delivery platform payout`, `Weekly app
+   earnings`, `Task marketplace payout`, `Driver platform payout`) --
+   exactly the cross-description pooling entry 9 was built to catch, and
+   40,977.52 is genuinely the minimum of the 21 real amounts. This is the
+   best-evidenced gig stream in the dataset, not a thin or miscomputed one.
+4. Tried a middle ground: credit only a gig stream's single next
+   occurrence, not the full cadence, and re-ran `--validate`. Mean relative
+   amount error improved slightly (0.265 to 0.231), but the exact-match
+   counts didn't move -- `request_09` fixes, `request_11` breaks the same
+   way as full inclusion did, a wash rather than an improvement.
+5. Checked the one remaining distinguishing hypothesis: maybe gig income
+   should only be excluded when the user has other income to fall back on.
+   `user_09` and `user_10` are both gig-only (no `continuing_salary`
+   stream at all) yet need opposite treatment, ruling this out too.
+
+**Decision.** Keep the exclusion. It was re-tested against the real data
+three different ways, not left standing on the strength of an old
+measurement -- every alternative tried makes the aggregate result worse or
+is a wash, and the two clearest counterexamples are both gig-only-income
+users pulling in opposite directions from each other. `user_09`'s specific
+undershoot remains unexplained, but chasing it further risks curve-fitting
+two ambiguous data points in a dataset explicitly documented as a style
+guide, not evaluation labels (AGENTS.md). The dead code itself was real --
+cleaned up by removing the now-pointless per-stream branch, since only
+`continuing_salary` ever reaches it -- but it was leftover shape from
+before the exclusion existed, not a disabled fix.
+
+**Question 2.** `amendments.py`'s `_patch_targeted_events` calls
+`_fx_normalize` before `passes_sanity_check`, which is what closed the
+`image_12`/`event_7307` cross-currency case. `_synthesize_income_events` --
+the path for a target-less `amount_change`, `date_change`, or
+`no_confirmed_income` fact -- went straight to `passes_sanity_check` with
+no conversion step, so a foreign-currency fact on that path would be
+silently dropped the same way the targeted case used to fail.
+
+**Confirmed reachable, not just theoretical:** 6 of the 275 users have
+exactly this -- a target-less `amount_change` fact, confidence 0.95, in a
+currency other than their own home currency (`user_71`, `user_98`,
+`user_125`, `user_173`, `user_245`, `user_263`; USD/EUR facts against
+INR/ZAR/IDR home currencies). All 6 were being silently dropped before this
+fix.
+
+**Decision.** Apply the same `_fx_normalize` call inside
+`_synthesize_income_events` before its own `passes_sanity_check`, using
+`fact.date` as the conversion date (there is no target event to pull a
+settlement date from on this path). Confirmed fixed: all 6 facts now
+produce a correctly-converted synthetic `"Next confirmed salary"` event
+(e.g. `user_71`'s USD 696 message converts to IDR 11,019,997.68).
+
+**Measured effect, honestly reported rather than assumed:** the full
+250-row aggregate action distribution is unchanged by this fix --
+`not_recommended` stays at 99/250, every other method/status count
+identical before and after. Checked why, per-user: for all 6 affected
+users, the converted synthetic event's amount is a near-exact match for
+what that user's own structured salary history already independently
+computed (`user_71`: both paths give exactly 11,019,997.68). These 6
+messages are salary *confirmations* that happen to restate a figure the
+structured data already had right, not corrections that disagree with it,
+so closing this gap doesn't move this particular dataset's numbers. The fix
+is still correct to make: the previous behavior was silently discarding
+confirmable evidence rather than using it, and a case where a message
+*disagrees* with stale structured data would have been affected and wasn't
+tested here only because none happens to exist in this dataset.
+
+**Correcting a previous report.** The prior status report described "0/231
+unresolved blank-amount events, down from 16." That mixed two unrelated
+counts: 231 is Stage 2's total source count (215 messages + 16 images,
+ARCHITECTURE.md Stage 2), not the population of blank-amount events, which
+entry 7 already established as exactly 16. Re-verified directly:
+`financial_events.csv` has exactly 16 rows with a blank `amount`, and
+summing `unresolved_events` across all 275 per-user states gives exactly 0.
+The result -- 0/16, not 0/231 -- was already correct; only its write-up
+mislabeled the denominator.

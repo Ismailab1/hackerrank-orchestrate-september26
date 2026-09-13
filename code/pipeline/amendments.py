@@ -95,11 +95,17 @@ def _most_recent_continuing_amount(events: list[Event]) -> float | None:
     return candidates[-1].amount if candidates else None
 
 
-def _synthesize_income_events(events: list[Event], facts: list[ExtractedFact], profile, as_of_date, messages_by_id) -> list[Event]:
+def _synthesize_income_events(
+    events: list[Event], facts: list[ExtractedFact], profile, as_of_date, fx, messages_by_id
+) -> list[Event]:
     synthetic: list[Event] = []
     for fact in facts:
         if fact.target_event_id is not None or fact.source_type != "message":
             continue
+        # No target event to pull a settlement date from here, unlike
+        # _patch_targeted_events -- fact.date is the only date available,
+        # and it's what _fx_normalize falls back to when given no target_event.
+        fact = _fx_normalize(fact, profile, fx, None)
         if not passes_sanity_check(fact, profile):
             continue
         message = messages_by_id.get(fact.source_id)
@@ -166,7 +172,7 @@ def apply_amendments(
     `facts` should already be filtered to this user (any order, any
     sanity-check status -- this function re-checks per fact)."""
     events = _patch_targeted_events(events, facts, profile, fx)
-    events = _synthesize_income_events(events, facts, profile, as_of_date, messages_by_id)
+    events = _synthesize_income_events(events, facts, profile, as_of_date, fx, messages_by_id)
     return events
 
 
